@@ -401,6 +401,11 @@ class TestVoxtralConfig(unittest.TestCase):
         self.assertEqual(config.rope_theta, 100000000.0)
         self.assertIsNone(config.rope_scaling)
 
+    def test_text_config_use_cache_default(self):
+        """Test that use_cache is True by default (required by LlamaModel)."""
+        config = TextConfig()
+        self.assertTrue(config.use_cache)
+
     def test_text_config_from_dict(self):
         """Test TextConfig.from_dict with layer_types."""
         params = {

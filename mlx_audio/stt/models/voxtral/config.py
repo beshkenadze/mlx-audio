@@ -52,6 +52,7 @@ class TextConfig:
     hidden_act: str = "silu"
     initializer_range: float = 0.02
     rms_norm_eps: float = 1e-5
+    use_cache: bool = True
     rope_theta: float = 100000000.0
     rope_scaling: Optional[Dict[str, Any]] = None
     attention_bias: bool = False
