@@ -52,7 +52,6 @@ class TextConfig:
     hidden_act: str = "silu"
     initializer_range: float = 0.02
     rms_norm_eps: float = 1e-5
-    use_cache: bool = True
     rope_theta: float = 100000000.0
     rope_scaling: Optional[Dict[str, Any]] = None
     attention_bias: bool = False
@@ -64,8 +63,11 @@ class TextConfig:
     eos_token_id: int = 2
     sliding_window: Optional[int] = None
     rope_traditional: bool = False
-    rope_scaling: Optional[Dict[str, Any]] = None
-    rope_theta: float = 100000000.0
+    layer_types: Optional[List[str]] = None
+
+    def __post_init__(self):
+        if self.layer_types is None:
+            self.layer_types = ["full_attention"] * self.num_hidden_layers
 
     @classmethod
     def from_dict(cls, params):
