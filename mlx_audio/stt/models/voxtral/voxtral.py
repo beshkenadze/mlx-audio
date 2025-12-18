@@ -11,7 +11,7 @@ import numpy as np
 from mlx_audio.stt.generate import wired_limit
 from mlx_audio.stt.utils import get_model_path
 
-from .config import AudioConfig, ModelConfig, TextConfig
+from .config import AudioConfig, ModelConfig
 
 
 @dataclass

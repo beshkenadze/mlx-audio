@@ -13,7 +13,6 @@ from mlx_lm.tokenizer_utils import load as load_tokenizer
 from tqdm import tqdm
 
 from mlx_audio.tts.models.base import BaseModelArgs, GenerationResult
-from mlx_audio.tts.utils import get_model_path
 
 from .audio_tokenizer import BiCodecTokenizer
 from .utils.token_parser import GENDER_MAP, LEVELS_MAP, TASK_TOKEN_MAP
@@ -96,7 +95,7 @@ class Model(nn.Module):
     def layers(self):
         return self.model.layers
 
-    def model_quant_predicate(self, p, m, config):
+    def model_quant_predicate(self, p, m):
         """
         Model modules to skip during quantization
         """
@@ -306,7 +305,7 @@ class Model(nn.Module):
 
             # Decode the generated tokens into text
             predicts = self.tokenizer._tokenizer.batch_decode(
-                generated_ids, skip_special_tokens=True
+                generated_ids, skip_special_tokens=False
             )[0]
 
             # Extract semantic token IDs from the generated text

@@ -11,11 +11,16 @@ import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten
-from mlx_lm.convert import mixed_quant_predicate_builder
-from mlx_lm.utils import dequantize_model, quantize_model, save_config, save_model
-from transformers import AutoConfig
 
-MODEL_REMAPPING = {"outetts": "outetts", "spark": "spark", "csm": "sesame"}
+MODEL_REMAPPING = {
+    "outetts": "outetts",
+    "spark": "spark",
+    "csm": "sesame",
+    "voxcpm": "voxcpm",
+    "voxcpm1.5": "voxcpm",
+    "vibevoice_streaming": "vibevoice",
+    "chatterbox_turbo": "chatterbox_turbo",
+}
 MAX_FILE_SIZE_GB = 5
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
 
@@ -50,6 +55,7 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
                     "*.yaml",
                     "*.wav",
                     "*.txt",
+                    "*.pth",
                 ],
             )
         )
@@ -98,11 +104,11 @@ def get_model_and_args(model_type: str, model_name: List[str]):
         ValueError: If the model type is not supported (module import fails).
     """
     # Stage 1: Check if the model type is in the remapping
-    model_type = MODEL_REMAPPING.get(model_type, model_type)
+    model_type_mapped = MODEL_REMAPPING.get(model_type, None)
 
     # Stage 2: Check for partial matches in segments of the model name
     models = get_available_models()
-    if model_name is not None:
+    if model_name is not None and model_type_mapped is None:
         for part in model_name:
             # First check if the part matches an available model directory name
             if part in models:
@@ -136,6 +142,8 @@ def load_config(model_path: Union[str, Path], **kwargs) -> dict:
     Raises:
         FileNotFoundError: If config.json is not found at the path
     """
+    from transformers import AutoConfig
+
     if isinstance(model_path, str):
         model_path = get_model_path(model_path)
 
@@ -172,17 +180,27 @@ def load_model(
     if isinstance(model_path, str):
         model_name = model_path.lower().split("/")[-1].split("-")
         model_path = get_model_path(model_path)
-    elif isinstance(model_path, Path):
-        index = model_path.parts.index("hub")
-        model_name = model_path.parts[index + 1].lower().split("--")[-1].split("-")
+    if isinstance(model_path, Path):
+        try:
+            index = model_path.parts.index("hub")
+            model_name = model_path.parts[index + 1].lower().split("--")[-1].split("-")
+        except ValueError:
+            # Fallback for local paths not in HF cache structure
+            model_name = model_path.name.lower().split("-")
     else:
         raise ValueError(f"Invalid model path type: {type(model_path)}")
 
     config = load_config(model_path, **kwargs)
     config["tokenizer_name"] = model_path
+    config["model_path"] = str(
+        model_path
+    )  # Ensure explicit string path in config dict for strict parsers
 
     # Determine model_type from config or model_name
     model_type = config.get("model_type", None)
+    if model_type is None:
+        model_type = config.get("architecture", None)  # Fallback to architecture
+
     if model_type is None:
         model_type = model_name[0].lower() if model_name is not None else None
 
@@ -267,6 +285,13 @@ python -m mlx_audio.tts.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         mx.eval(model.parameters())
 
     model.eval()
+
+    # Call post-load hook if the model defines one
+    # This allows models to initialize tokenizers or other resources
+    # Note: model_class is actually the module, Model class is model_class.Model
+    if hasattr(model_class.Model, "post_load_hook"):
+        model = model_class.Model.post_load_hook(model, model_path)
+
     return model
 
 
@@ -338,6 +363,9 @@ def convert(
     trust_remote_code: bool = True,
     quant_predicate: Optional[str] = None,
 ):
+    from mlx_lm.convert import mixed_quant_predicate_builder
+    from mlx_lm.utils import dequantize_model, quantize_model, save_config, save_model
+
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
     model, config = fetch_from_hub(
@@ -348,17 +376,15 @@ def convert(
         quant_predicate = mixed_quant_predicate_builder(quant_predicate, model)
 
     # Get model-specific quantization predicate if available
-    model_quant_predicate = getattr(
-        model, "model_quant_predicate", lambda p, m, config: True
-    )
+    model_quant_predicate = getattr(model, "model_quant_predicate", lambda p, m: True)
 
     # Define base quantization requirements
-    def base_quant_requirements(p, m, config):
+    def base_quant_requirements(p, m):
         return (
             hasattr(m, "weight")
             and m.weight.shape[-1] % 64 == 0  # Skip layers not divisible by 64
             and hasattr(m, "to_quantized")
-            and model_quant_predicate(p, m, config)
+            and model_quant_predicate(p, m)
         )
 
     # Combine with user-provided predicate if available
@@ -366,8 +392,8 @@ def convert(
         quant_predicate = base_quant_requirements
     else:
         original_predicate = quant_predicate
-        quant_predicate = lambda p, m, config: (
-            base_quant_requirements(p, m, config) and original_predicate(p, m, config)
+        quant_predicate = lambda p, m: (
+            base_quant_requirements(p, m) and original_predicate(p, m)
         )
 
     weights = dict(tree_flatten(model.parameters()))

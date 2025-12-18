@@ -669,6 +669,163 @@ class TestLlamaModel(unittest.TestCase):
             self.assertIn("lm_head.weight", sanitized2)
 
 
+class TestQwen3Model(unittest.TestCase):
+    @property
+    def _default_config(self):
+        return {
+            "head_dim": 128,
+            "hidden_size": 2048,
+            "intermediate_size": 6144,
+            "max_position_embeddings": 40960,
+            "model_type": "qwen3",
+            "num_attention_heads": 16,
+            "num_hidden_layers": 28,
+            "num_key_value_heads": 8,
+            "rms_norm_eps": 1e-06,
+            "rope_theta": 1000000,
+            "tie_word_embeddings": True,
+            "vocab_size": 180352,
+        }
+
+    @patch("transformers.AutoTokenizer")
+    def test_init(self, mock_tokenizer):
+        """Test Qwen3Model initialization."""
+        from mlx_audio.tts.models.qwen3.qwen3 import Model, ModelConfig
+
+        # Mock the tokenizer instance
+        mock_tokenizer_instance = MagicMock()
+        mock_tokenizer.from_pretrained.return_value = mock_tokenizer_instance
+
+        # Create a minimal config
+        config = ModelConfig(**self._default_config)
+
+        # Initialize model
+        model = Model(config)
+
+        # Check that model was created
+        self.assertIsInstance(model, Model)
+        self.assertEqual(model.model_type, "qwen3")
+        self.assertIsNone(model.tokenizer)
+
+    @patch("transformers.AutoTokenizer")
+    def test_forward(self, mock_tokenizer):
+        """Test forward pass."""
+        from mlx_audio.tts.models.qwen3.qwen3 import Model, ModelConfig
+
+        # Mock tokenizer instance
+        mock_tokenizer_instance = MagicMock()
+        mock_tokenizer.from_pretrained.return_value = mock_tokenizer_instance
+
+        config = ModelConfig(**self._default_config)
+        model = Model(config)
+
+        # Test forward pass with random input
+        input_ids = mx.random.randint(0, config.vocab_size, (2, 9))
+        logits = model(input_ids)
+        self.assertEqual(logits.shape, (2, 9, config.vocab_size))
+
+    @patch("transformers.AutoTokenizer")
+    def test_prepare_input_ids_with_voice(self, mock_tokenizer):
+        """Test prepare_input_ids method with voice."""
+        from mlx_audio.tts.models.qwen3.qwen3 import Model, ModelConfig
+
+        # Mock tokenizer instance
+        mock_tokenizer_instance = MagicMock()
+
+        # Mock tokenizer __call__ to return proper input_ids
+        def mock_tokenize(text, return_tensors=None):
+            result = MagicMock()
+            # Return a simple token sequence for each text
+            result.input_ids = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int64)
+            return result
+
+        mock_tokenizer_instance.side_effect = mock_tokenize
+        mock_tokenizer_instance.__call__ = mock_tokenize
+        mock_tokenizer.from_pretrained.return_value = mock_tokenizer_instance
+
+        config = ModelConfig(**self._default_config)
+        model = Model(config)
+        model.tokenizer = mock_tokenizer_instance
+
+        # Test with voice
+        input_ids, input_mask = model.prepare_input_ids(["Hello", "World"], voice="zoe")
+
+        # Verify batch size
+        self.assertEqual(input_ids.shape[0], 2)
+        self.assertEqual(input_mask.shape[0], 2)
+
+        # Verify mask shape matches input_ids shape
+        self.assertEqual(input_ids.shape, input_mask.shape)
+
+    @patch("transformers.AutoTokenizer")
+    def test_parse_output(self, mock_tokenizer):
+        """Test parse_output method."""
+        from mlx_audio.tts.models.qwen3.qwen3 import (
+            AUDIO_TOKENS_START,
+            END_OF_SPEECH,
+            START_OF_SPEECH,
+            Model,
+            ModelConfig,
+        )
+
+        # Mock tokenizer instance
+        mock_tokenizer_instance = MagicMock()
+        mock_tokenizer.from_pretrained.return_value = mock_tokenizer_instance
+
+        config = ModelConfig(**self._default_config)
+        model = Model(config)
+
+        # Create input with speech tokens
+        # Format: [START_OF_SPEECH, audio_tokens..., END_OF_SPEECH]
+        audio_tokens = [AUDIO_TOKENS_START + i for i in range(7)]  # 7 audio tokens
+        input_sequence = [START_OF_SPEECH] + audio_tokens + [END_OF_SPEECH]
+        input_ids = mx.array([input_sequence], dtype=mx.int64)
+
+        # Test parse_output
+        code_lists = model.parse_output(input_ids)
+
+        # Should return one code list (one batch item)
+        self.assertEqual(len(code_lists), 1)
+
+        # The code list should have 7 items (trimmed to multiple of 7)
+        self.assertEqual(len(code_lists[0]), 7)
+
+        # Verify codes are offset by AUDIO_TOKENS_START
+        for i, code in enumerate(code_lists[0]):
+            self.assertEqual(code, i)
+
+    @patch("transformers.AutoTokenizer")
+    def test_sample_rate(self, mock_tokenizer):
+        """Test sample_rate property."""
+        from mlx_audio.tts.models.qwen3.qwen3 import Model, ModelConfig
+
+        # Mock tokenizer instance
+        mock_tokenizer_instance = MagicMock()
+        mock_tokenizer.from_pretrained.return_value = mock_tokenizer_instance
+
+        config = ModelConfig(**self._default_config)
+        model = Model(config)
+
+        # Default sample rate should be 24000
+        self.assertEqual(model.sample_rate, 24000)
+
+    @patch("transformers.AutoTokenizer")
+    def test_layers_property(self, mock_tokenizer):
+        """Test layers property returns model layers."""
+        from mlx_audio.tts.models.qwen3.qwen3 import Model, ModelConfig
+
+        # Mock tokenizer instance
+        mock_tokenizer_instance = MagicMock()
+        mock_tokenizer.from_pretrained.return_value = mock_tokenizer_instance
+
+        config = ModelConfig(**self._default_config)
+        model = Model(config)
+
+        # Verify layers property returns the model's layers
+        layers = model.layers
+        self.assertEqual(len(layers), config.num_hidden_layers)
+
+
 class TestOuteTTSModel(unittest.TestCase):
     @property
     def _default_config(self):
@@ -973,6 +1130,421 @@ class TestIndexTTS(unittest.TestCase):
 
         # Check that model was created
         self.assertIsInstance(model, Model)
+
+
+class TestVibeVoiceModel(unittest.TestCase):
+    @property
+    def _default_config(self):
+        from mlx_audio.tts.models.vibevoice.config import ModelConfig
+
+        return ModelConfig(
+            model_path="/fake/model/path",
+            sample_rate=24000,
+        )
+
+    def test_init(self):
+        """Test VibeVoiceModel initialization."""
+        from mlx_audio.tts.models.vibevoice.vibevoice import Model
+
+        # Initialize model
+        config = self._default_config
+        model = Model(config)
+
+        # Check that model was created
+        self.assertIsInstance(model, Model)
+
+        # Verify model components exist
+        self.assertIsNotNone(model.language_model)
+        self.assertIsNotNone(model.tts_language_model)
+        self.assertIsNotNone(model.acoustic_tokenizer)
+        self.assertIsNotNone(model.prediction_head)
+        self.assertIsNotNone(model.tts_eos_classifier)
+
+    def test_sample_rate(self):
+        """Test VibeVoiceModel sample_rate property."""
+        from mlx_audio.tts.models.vibevoice.vibevoice import Model
+
+        config = self._default_config
+        model = Model(config)
+
+        self.assertEqual(model.sample_rate, 24000)
+
+    def test_get_input_embeddings(self):
+        """Test VibeVoiceModel get_input_embeddings method."""
+        from mlx_audio.tts.models.vibevoice.vibevoice import Model
+
+        config = self._default_config
+        model = Model(config)
+
+        embeddings = model.get_input_embeddings()
+        self.assertIsInstance(embeddings, nn.Embedding)
+        self.assertEqual(embeddings.weight.shape[0], config.decoder_config.vocab_size)
+
+    def test_sanitize(self):
+        """Test VibeVoiceModel sanitize method."""
+        from mlx.utils import tree_flatten
+
+        from mlx_audio.tts.models.vibevoice.vibevoice import Model
+
+        config = self._default_config
+        model = Model(config)
+
+        # Test sanitize with model's own weights (no transformation needed)
+        weights = dict(tree_flatten(model.parameters()))
+        sanitized = model.sanitize(weights)
+
+        # Sanitized weights should contain valid keys
+        self.assertIsInstance(sanitized, dict)
+
+    def test_sanitize_huggingface_keys(self):
+        """Test VibeVoiceModel sanitize transforms HuggingFace keys."""
+        from mlx_audio.tts.models.vibevoice.vibevoice import Model
+
+        config = self._default_config
+        model = Model(config)
+
+        # Create mock weights with HuggingFace-style keys
+        mock_weights = {
+            "model.prediction_head.t_embedder.mlp.0.weight": mx.zeros((64, 64)),
+            "model.prediction_head.adaLN_modulation.1.weight": mx.zeros((64, 64)),
+        }
+
+        sanitized = model.sanitize(mock_weights)
+
+        # Check that keys were transformed (original keys should not exist)
+        self.assertNotIn("model.prediction_head.t_embedder.mlp.0.weight", sanitized)
+        self.assertNotIn("model.prediction_head.adaLN_modulation.1.weight", sanitized)
+
+    def test_config_defaults(self):
+        """Test VibeVoiceModel uses correct config defaults."""
+        from mlx_audio.tts.models.vibevoice.config import ModelConfig
+
+        config = ModelConfig()
+
+        # Verify default values
+        self.assertEqual(config.sample_rate, 24000)
+        self.assertEqual(config.acoustic_vae_dim, 64)
+        self.assertEqual(config.tts_backbone_num_hidden_layers, 20)
+        self.assertEqual(config.decoder_config.hidden_size, 896)
+        self.assertEqual(config.decoder_config.num_hidden_layers, 24)
+
+
+class TestChatterboxConfig(unittest.TestCase):
+    def test_t3_config_defaults(self):
+        """Test T3Config default values and factory methods."""
+        from mlx_audio.tts.models.chatterbox.config import T3Config
+
+        # Test defaults
+        config = T3Config()
+        self.assertEqual(config.text_tokens_dict_size, 704)
+        self.assertEqual(config.speech_tokens_dict_size, 8194)
+        self.assertEqual(config.llama_config_name, "Llama_520M")
+        self.assertEqual(config.n_channels, 1024)
+        self.assertFalse(config.is_multilingual)
+
+        # Test factory methods
+        self.assertFalse(T3Config.english_only().is_multilingual)
+        self.assertTrue(T3Config.multilingual().is_multilingual)
+
+    def test_model_config_defaults(self):
+        """Test ModelConfig default values."""
+        from mlx_audio.tts.models.chatterbox.config import ModelConfig
+
+        config = ModelConfig()
+
+        self.assertEqual(config.model_type, "chatterbox")
+        self.assertEqual(config.s3_sr, 16000)
+        self.assertEqual(config.s3gen_sr, 24000)
+        self.assertEqual(config.sample_rate, 24000)
+        self.assertIsNotNone(config.t3_config)
+
+    def test_model_config_from_dict(self):
+        """Test ModelConfig.from_dict method."""
+        from mlx_audio.tts.models.chatterbox.config import ModelConfig
+
+        config_dict = {
+            "model_type": "chatterbox",
+            "t3_config": {
+                "text_tokens_dict_size": 2454,
+            },
+        }
+
+        config = ModelConfig.from_dict(config_dict)
+
+        self.assertEqual(config.model_type, "chatterbox")
+        self.assertTrue(config.t3_config.is_multilingual)
+
+
+class TestChatterboxModel(unittest.TestCase):
+    @patch("mlx_audio.tts.models.chatterbox.chatterbox.T3")
+    @patch("mlx_audio.tts.models.chatterbox.chatterbox.S3Token2Wav")
+    @patch("mlx_audio.tts.models.chatterbox.chatterbox.VoiceEncoder")
+    @patch("mlx_audio.tts.models.chatterbox.chatterbox.S3TokenizerV2")
+    def test_init(self, mock_s3_tokenizer, mock_ve, mock_s3gen, mock_t3):
+        """Test Model initialization with config."""
+        from mlx_audio.tts.models.chatterbox.chatterbox import Model
+        from mlx_audio.tts.models.chatterbox.config import ModelConfig
+
+        config = ModelConfig()
+        model = Model(config)
+
+        self.assertIsNotNone(model.t3)
+        self.assertIsNotNone(model.s3gen)
+        self.assertIsNotNone(model.ve)
+        self.assertEqual(model.sr, 24000)
+        self.assertEqual(model.sample_rate, 24000)
+
+    @patch("mlx_audio.tts.models.chatterbox.chatterbox.T3")
+    @patch("mlx_audio.tts.models.chatterbox.chatterbox.S3Token2Wav")
+    @patch("mlx_audio.tts.models.chatterbox.chatterbox.VoiceEncoder")
+    @patch("mlx_audio.tts.models.chatterbox.chatterbox.S3TokenizerV2")
+    def test_sanitize(
+        self, mock_s3_tokenizer, mock_ve_class, mock_s3gen_class, mock_t3_class
+    ):
+        """Test weight sanitization routes to correct components."""
+        from mlx_audio.tts.models.chatterbox.chatterbox import Model
+
+        # Mock components to have sanitize methods that pass through weights
+        for mock_class in [
+            mock_ve_class,
+            mock_t3_class,
+            mock_s3gen_class,
+            mock_s3_tokenizer,
+        ]:
+            mock_class.return_value.sanitize.side_effect = lambda w: w
+
+        model = Model()
+
+        # Test that prefixed weights are routed and re-prefixed
+        weights = {
+            "ve.lstm.weight": mx.zeros((10, 10)),
+            "t3.tfmr.weight": mx.zeros((10, 10)),
+            "s3gen.flow.weight": mx.zeros((10, 10)),
+        }
+
+        result = model.sanitize(weights)
+
+        # Verify weights keep their prefixes
+        self.assertIn("ve.lstm.weight", result)
+        self.assertIn("t3.tfmr.weight", result)
+        self.assertIn("s3gen.flow.weight", result)
+
+
+class TestChatterboxTurboConfig(unittest.TestCase):
+    def test_t3_config_defaults(self):
+        """Test T3Config default values."""
+        from mlx_audio.tts.models.chatterbox_turbo.models.t3 import T3Config
+
+        config = T3Config()
+        self.assertEqual(config.text_tokens_dict_size, 50276)
+        self.assertEqual(config.speech_tokens_dict_size, 6563)
+        self.assertEqual(config.llama_config_name, "GPT2_medium")
+        self.assertEqual(config.n_channels, 1024)
+        self.assertEqual(config.speaker_embed_size, 256)
+        self.assertEqual(config.speech_cond_prompt_len, 375)
+        self.assertFalse(config.emotion_adv)
+        self.assertFalse(config.use_perceiver_resampler)
+
+    def test_t3_config_turbo_factory(self):
+        """Test T3Config.turbo() factory method."""
+        from mlx_audio.tts.models.chatterbox_turbo.models.t3 import T3Config
+
+        config = T3Config.turbo()
+        self.assertEqual(config.text_tokens_dict_size, 50276)
+        self.assertEqual(config.speech_tokens_dict_size, 6563)
+        self.assertEqual(config.llama_config_name, "GPT2_medium")
+        self.assertEqual(config.speech_cond_prompt_len, 375)
+        self.assertFalse(config.emotion_adv)
+        self.assertFalse(config.use_perceiver_resampler)
+
+    def test_t3_config_is_multilingual(self):
+        """Test is_multilingual property."""
+        from mlx_audio.tts.models.chatterbox_turbo.models.t3 import T3Config
+
+        # Default turbo config is not multilingual
+        config = T3Config.turbo()
+        self.assertFalse(config.is_multilingual)
+
+        # Multilingual config has text_tokens_dict_size == 2454
+        multilingual_config = T3Config(text_tokens_dict_size=2454)
+        self.assertTrue(multilingual_config.is_multilingual)
+
+
+class TestChatterboxTurboPuncNorm(unittest.TestCase):
+    def test_empty_string(self):
+        """Test punc_norm handles empty string."""
+        from mlx_audio.tts.models.chatterbox_turbo import punc_norm
+
+        result = punc_norm("")
+        self.assertEqual(result, "You need to add some text for me to talk.")
+
+    def test_capitalizes_first_letter(self):
+        """Test punc_norm capitalizes first letter."""
+        from mlx_audio.tts.models.chatterbox_turbo import punc_norm
+
+        result = punc_norm("hello world")
+        self.assertTrue(result[0].isupper())
+
+    def test_adds_period_if_missing(self):
+        """Test punc_norm adds period if no ending punctuation."""
+        from mlx_audio.tts.models.chatterbox_turbo import punc_norm
+
+        result = punc_norm("Hello world")
+        self.assertTrue(result.endswith("."))
+
+    def test_keeps_existing_punctuation(self):
+        """Test punc_norm keeps existing ending punctuation."""
+        from mlx_audio.tts.models.chatterbox_turbo import punc_norm
+
+        self.assertTrue(punc_norm("Hello world!").endswith("!"))
+        self.assertTrue(punc_norm("Hello world?").endswith("?"))
+        self.assertTrue(punc_norm("Hello world.").endswith("."))
+
+    def test_removes_multiple_spaces(self):
+        """Test punc_norm removes multiple spaces."""
+        from mlx_audio.tts.models.chatterbox_turbo import punc_norm
+
+        result = punc_norm("Hello    world")
+        self.assertNotIn("  ", result)
+
+    def test_replaces_special_punctuation(self):
+        """Test punc_norm replaces special punctuation."""
+        from mlx_audio.tts.models.chatterbox_turbo import punc_norm
+
+        # Test ellipsis replacement
+        result = punc_norm("Hello… world")
+        self.assertNotIn("…", result)
+
+        # Test em dash replacement
+        result = punc_norm("Hello—world")
+        self.assertIn("-", result)
+
+
+class TestChatterboxTurboModel(unittest.TestCase):
+    @patch("mlx_audio.tts.models.chatterbox_turbo.chatterbox_turbo.T3")
+    @patch("mlx_audio.tts.models.chatterbox_turbo.chatterbox_turbo.S3Gen")
+    @patch("mlx_audio.tts.models.chatterbox_turbo.chatterbox_turbo.VoiceEncoder")
+    @patch("mlx_audio.tts.models.chatterbox_turbo.chatterbox_turbo.S3TokenizerV2")
+    def test_init_with_config(self, mock_s3_tokenizer, mock_ve, mock_s3gen, mock_t3):
+        """Test ChatterboxTurboTTS initialization with config dict."""
+        from mlx_audio.tts.models.chatterbox_turbo import ChatterboxTurboTTS
+
+        model = ChatterboxTurboTTS(config_or_t3={})
+
+        self.assertIsNotNone(model.t3)
+        self.assertIsNotNone(model.s3gen)
+        self.assertIsNotNone(model.ve)
+        self.assertEqual(model.sr, 24000)
+        self.assertEqual(model.sample_rate, 24000)
+
+    @patch("mlx_audio.tts.models.chatterbox_turbo.chatterbox_turbo.T3")
+    @patch("mlx_audio.tts.models.chatterbox_turbo.chatterbox_turbo.S3Gen")
+    @patch("mlx_audio.tts.models.chatterbox_turbo.chatterbox_turbo.VoiceEncoder")
+    @patch("mlx_audio.tts.models.chatterbox_turbo.chatterbox_turbo.S3TokenizerV2")
+    def test_init_with_none(self, mock_s3_tokenizer, mock_ve, mock_s3gen, mock_t3):
+        """Test ChatterboxTurboTTS initialization with None (default config)."""
+        from mlx_audio.tts.models.chatterbox_turbo import ChatterboxTurboTTS
+
+        model = ChatterboxTurboTTS()
+
+        self.assertIsNotNone(model.t3)
+        self.assertIsNotNone(model.s3gen)
+        self.assertIsNotNone(model.ve)
+
+    @patch("mlx_audio.tts.models.chatterbox_turbo.chatterbox_turbo.T3")
+    @patch("mlx_audio.tts.models.chatterbox_turbo.chatterbox_turbo.S3Gen")
+    @patch("mlx_audio.tts.models.chatterbox_turbo.chatterbox_turbo.VoiceEncoder")
+    @patch("mlx_audio.tts.models.chatterbox_turbo.chatterbox_turbo.S3TokenizerV2")
+    def test_sanitize(
+        self, mock_s3_tokenizer, mock_ve_class, mock_s3gen_class, mock_t3_class
+    ):
+        """Test weight sanitization routes to correct components."""
+        from mlx_audio.tts.models.chatterbox_turbo import ChatterboxTurboTTS
+
+        # Mock components to have sanitize methods that pass through weights
+        for mock_class in [
+            mock_ve_class,
+            mock_t3_class,
+            mock_s3gen_class,
+            mock_s3_tokenizer,
+        ]:
+            mock_class.return_value.sanitize.side_effect = lambda w: w
+
+        model = ChatterboxTurboTTS()
+
+        # Test that prefixed weights are routed and re-prefixed
+        weights = {
+            "ve.lstm.weight": mx.zeros((10, 10)),
+            "t3.tfmr.weight": mx.zeros((10, 10)),
+            "s3gen.flow.weight": mx.zeros((10, 10)),
+        }
+
+        result = model.sanitize(weights)
+
+        # Verify weights keep their prefixes
+        self.assertIn("ve.lstm.weight", result)
+        self.assertIn("t3.tfmr.weight", result)
+        self.assertIn("s3gen.flow.weight", result)
+
+    @patch("mlx_audio.tts.models.chatterbox_turbo.chatterbox_turbo.T3")
+    @patch("mlx_audio.tts.models.chatterbox_turbo.chatterbox_turbo.S3Gen")
+    @patch("mlx_audio.tts.models.chatterbox_turbo.chatterbox_turbo.VoiceEncoder")
+    @patch("mlx_audio.tts.models.chatterbox_turbo.chatterbox_turbo.S3TokenizerV2")
+    def test_sanitize_with_other_weights(
+        self, mock_s3_tokenizer, mock_ve_class, mock_s3gen_class, mock_t3_class
+    ):
+        """Test that unrecognized weights pass through sanitization."""
+        from mlx_audio.tts.models.chatterbox_turbo import ChatterboxTurboTTS
+
+        # Mock components to have sanitize methods that pass through weights
+        for mock_class in [
+            mock_ve_class,
+            mock_t3_class,
+            mock_s3gen_class,
+            mock_s3_tokenizer,
+        ]:
+            mock_class.return_value.sanitize.side_effect = lambda w: w
+
+        model = ChatterboxTurboTTS()
+
+        # Test with weights that don't have known prefixes
+        weights = {
+            "ve.lstm.weight": mx.zeros((10, 10)),
+            "unknown.param": mx.zeros((5, 5)),
+        }
+
+        result = model.sanitize(weights)
+
+        # Both should be in result
+        self.assertIn("ve.lstm.weight", result)
+        self.assertIn("unknown.param", result)
+
+
+class TestChatterboxTurboConditionals(unittest.TestCase):
+    def test_conditionals_dataclass(self):
+        """Test Conditionals dataclass creation."""
+        from mlx_audio.tts.models.chatterbox_turbo import Conditionals
+        from mlx_audio.tts.models.chatterbox_turbo.models.t3 import T3Cond
+
+        t3_cond = T3Cond(
+            speaker_emb=mx.zeros((1, 256)),
+            cond_prompt_speech_tokens=mx.zeros((1, 375), dtype=mx.int32),
+        )
+        gen_dict = {"ref_mel": mx.zeros((1, 80, 100))}
+
+        conds = Conditionals(t3=t3_cond, gen=gen_dict)
+
+        self.assertIsNotNone(conds.t3)
+        self.assertIsNotNone(conds.gen)
+        self.assertEqual(conds.t3.speaker_emb.shape, (1, 256))
+
+
+class TestChatterboxTurboModelAlias(unittest.TestCase):
+    def test_model_alias(self):
+        """Test that Model is aliased to ChatterboxTurboTTS."""
+        from mlx_audio.tts.models.chatterbox_turbo import ChatterboxTurboTTS, Model
+
+        self.assertIs(Model, ChatterboxTurboTTS)
 
 
 if __name__ == "__main__":

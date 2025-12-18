@@ -229,6 +229,8 @@ def generate(
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
     if format == "txt" or segments.segments is None:
+        if segments.segments is None:
+            print("[WARNING] No segments found, saving as plain text.")
         save_as_txt(segments, output_path)
         if segments.segments is None and format != "txt":
             print(
