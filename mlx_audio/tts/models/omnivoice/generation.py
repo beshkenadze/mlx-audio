@@ -48,14 +48,11 @@ def _unmask_step(
     masked_conf = mx.where(frozen, mx.array(-1.0), confidence)  # [T, C]
     flat_conf = masked_conf.reshape(-1)  # [T*C]
 
-    # argsort descending to get top-n_reveal positions
-    sorted_idx = mx.argsort(-flat_conf)
-    reveal_idx = sorted_idx[:n_reveal]  # [n_reveal]
-
-    # Build boolean reveal mask using broadcasting (MLX lacks scatter-set)
-    # positions [total, 1] == reveal_idx [1, n_reveal] -> any match along axis 1
-    positions = mx.arange(total)
-    reveal_mask_flat = mx.any(positions[:, None] == reveal_idx[None, :], axis=1)
+    # Double-argsort trick: rank[i] = position of element i in sorted order.
+    # rank < n_reveal selects the top-n_reveal positions without allocating
+    # the O(total * n_reveal) intermediate array that broadcasting would require.
+    rank = mx.argsort(mx.argsort(-flat_conf))  # [T*C]
+    reveal_mask_flat = rank < n_reveal
     reveal_mask = reveal_mask_flat.reshape(T, C)
 
     # Only update positions that are newly revealed (not already frozen)
@@ -75,6 +72,15 @@ def iterative_unmask(
     temperature: float = 5.0,
     tau: float = 0.1,
 ) -> mx.array:  # [T, 8] in [0, 1023]
+    """Run iterative unmasking decode for OmniVoice audio token generation.
+
+    NOTE: currently takes raw input_ids (token sequences) for the conditional
+    and unconditional branches. Phase 6 will refactor this signature to accept
+    pre-embedded cond_embeds/uncond_embeds (mx.array of shape [1, S, D]) to
+    support voice cloning — the embeddings will be computed once outside this
+    loop and injected directly into the model. This is a known gap blocked by
+    Phase 6 voice cloning work (spec §4.5).
+    """
     C = model.config.num_audio_codebook
     tokens = mx.full((T, C), AUDIO_MASK_ID, dtype=mx.int32)
     frozen = mx.zeros((T, C), dtype=mx.bool_)
@@ -105,7 +111,7 @@ def iterative_unmask(
         tokens, frozen = _unmask_step(tokens, frozen, new_tokens, confidence, n_reveal)
 
         # Materialize to prevent unbounded computation graph growth
-        mx.synchronize()
+        mx.eval(tokens, frozen)
 
     # Safety: replace any remaining mask tokens with token 0
     tokens = mx.where(tokens == AUDIO_MASK_ID, mx.zeros_like(tokens), tokens)
