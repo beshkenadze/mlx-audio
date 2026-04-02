@@ -439,6 +439,31 @@ class TestOmniVoiceGenerate(unittest.TestCase):
         result = model.generate(input_ids, duration_s=1.0, num_steps=5)
         self.assertGreater(result.processing_time_seconds, 0)
 
+    def test_generate_with_ref_tokens_changes_output(self):
+        model = self._make_model()
+        input_ids = mx.zeros((5,), dtype=mx.int32)
+
+        mx.random.seed(0)
+        result_auto = model.generate(input_ids, duration_s=0.5, num_steps=3)
+
+        ref_tokens = mx.ones(
+            (4, 8), dtype=mx.int32
+        )  # non-zero → different conditioning
+        mx.random.seed(0)
+        result_clone = model.generate(
+            input_ids, duration_s=0.5, num_steps=3, ref_tokens=ref_tokens
+        )
+
+        self.assertFalse(
+            bool(
+                mx.all(
+                    mx.array(result_auto.audio_samples)
+                    == mx.array(result_clone.audio_samples)
+                ).item()
+            ),
+            "ref_tokens had no effect on generated tokens",
+        )
+
 
 class TestVoiceCloneUtils(unittest.TestCase):
     def _call(self):

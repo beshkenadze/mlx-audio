@@ -86,8 +86,11 @@ class Model(nn.Module):
 
     def generate(
         self,
-        input_ids: mx.array,
+        input_ids: mx.array,  # [S] 1D text tokens
         duration_s: float,
+        ref_tokens: Optional[
+            mx.array
+        ] = None,  # [T_ref, 8] from create_voice_clone_prompt
         num_steps: int = 32,
         guidance_scale: float = 2.0,
         temperature: float = 5.0,
@@ -96,9 +99,15 @@ class Model(nn.Module):
 
         T = math.ceil(duration_s * self.config.sample_rate / 320)
         input_ids_b = input_ids[None]  # [1, S]
+        ref_b = ref_tokens[None] if ref_tokens is not None else None
 
-        cond_embeds = self.build_cond_embeds(input_ids_b)
+        cond_embeds = self.build_cond_embeds(input_ids_b, ref_b)
         uncond_embeds = self.build_cond_embeds(mx.zeros_like(input_ids_b))
+        # Pad uncond to match cond's prefix length with zeros
+        if cond_embeds.shape[1] > uncond_embeds.shape[1]:
+            pad_len = cond_embeds.shape[1] - uncond_embeds.shape[1]
+            pad = mx.zeros((1, pad_len, uncond_embeds.shape[2]))
+            uncond_embeds = mx.concatenate([uncond_embeds, pad], axis=1)
 
         start_time = time.time()
         tokens = iterative_unmask(
