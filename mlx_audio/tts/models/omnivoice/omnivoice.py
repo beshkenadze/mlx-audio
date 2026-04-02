@@ -52,17 +52,29 @@ class Model(nn.Module):
         )  # [B, T, H]
         return mx.concatenate([text_embeds, audio_embeds], axis=1)  # [B, S+T, H]
 
+    def build_cond_embeds(
+        self,
+        input_ids: mx.array,  # [1, S]
+        ref_tokens: Optional[mx.array] = None,  # [1, T_ref, 8]
+    ) -> mx.array:  # [1, S + T_ref, D]
+        """Build conditioning embedding: text + optional reference audio tokens."""
+        text_embeds = self.backbone.embed_tokens(input_ids)  # [1, S, D]
+        if ref_tokens is None:
+            return text_embeds
+        ref_embeds = sum(
+            self.audio_embeddings[i](ref_tokens[:, :, i])
+            for i in range(self.config.num_audio_codebook)
+        )  # [1, T_ref, D]
+        return mx.concatenate([text_embeds, ref_embeds], axis=1)
+
     def __call__(
         self,
-        input_ids: mx.array,  # [B, S]
-        audio_tokens: mx.array,  # [B, T, 8]
+        inputs_embeds: mx.array,  # [B, prefix_len+T, D]
+        prefix_len: int,
         attention_mask: Optional[mx.array] = None,
     ) -> mx.array:  # [B, T, 8, V]
-        inputs_embeds = self._embed(input_ids, audio_tokens)  # [B, S+T, H]
-        hidden = self.backbone(inputs_embeds, attention_mask)  # [B, S+T, H]
-        S = input_ids.shape[1]
-        audio_hidden = hidden[:, S:, :]  # [B, T, H]
-
+        hidden = self.backbone(inputs_embeds, attention_mask)  # [B, prefix_len+T, H]
+        audio_hidden = hidden[:, prefix_len:, :]  # [B, T, H]
         logits = mx.stack(
             [
                 self.audio_heads[i](audio_hidden)
@@ -83,15 +95,16 @@ class Model(nn.Module):
         from .generation import iterative_unmask
 
         T = math.ceil(duration_s * self.config.sample_rate / 320)
-        input_ids = input_ids[None]  # [1, S]
-        S = input_ids.shape[1]
-        input_ids_uncond = mx.zeros((1, S), dtype=mx.int32)
+        input_ids_b = input_ids[None]  # [1, S]
+
+        cond_embeds = self.build_cond_embeds(input_ids_b)
+        uncond_embeds = self.build_cond_embeds(mx.zeros_like(input_ids_b))
 
         start_time = time.time()
         tokens = iterative_unmask(
             self,
-            input_ids_cond=input_ids,
-            input_ids_uncond=input_ids_uncond,
+            cond_embeds=cond_embeds,
+            uncond_embeds=uncond_embeds,
             T=T,
             num_steps=num_steps,
             guidance_scale=guidance_scale,

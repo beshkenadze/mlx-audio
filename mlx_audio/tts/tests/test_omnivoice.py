@@ -129,8 +129,9 @@ class TestOmniVoiceModel(unittest.TestCase):
         model = self._make_model()
         B, S, T = 1, 5, 7
         input_ids = mx.zeros((B, S), dtype=mx.int32)
-        audio_tokens = mx.full((B, T, 8), 1024, dtype=mx.int32)  # all masked
-        logits = model(input_ids, audio_tokens)
+        audio_tokens = mx.full((B, T, 8), 1024, dtype=mx.int32)
+        inputs_embeds = model._embed(input_ids, audio_tokens)  # [B, S+T, D]
+        logits = model(inputs_embeds, prefix_len=S)
         self.assertEqual(logits.shape, (B, T, 8, 1025))
 
     def test_embed_shape(self):
@@ -140,6 +141,51 @@ class TestOmniVoiceModel(unittest.TestCase):
         audio_tokens = mx.full((B, T, 8), 1024, dtype=mx.int32)
         embeds = model._embed(input_ids, audio_tokens)
         self.assertEqual(embeds.shape, (B, S + T, 64))  # hidden_size=64 in test cfg
+
+
+class TestBuildCondEmbeds(unittest.TestCase):
+    def _make_model(self):
+        from mlx_audio.tts.models.omnivoice.config import OmniVoiceConfig
+        from mlx_audio.tts.models.omnivoice.omnivoice import Model
+
+        cfg = OmniVoiceConfig.from_dict(
+            {
+                "model_type": "omnivoice",
+                "audio_vocab_size": 1025,
+                "audio_mask_id": 1024,
+                "num_audio_codebook": 8,
+                "sample_rate": 24000,
+                "llm_config": {
+                    "hidden_size": 64,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "intermediate_size": 128,
+                    "vocab_size": 200,
+                    "head_dim": 16,
+                    "rms_norm_eps": 1e-6,
+                },
+            }
+        )
+        return Model(cfg)
+
+    def test_text_only_shape(self):
+        model = self._make_model()
+        embeds = model.build_cond_embeds(mx.zeros((1, 5), dtype=mx.int32))
+        self.assertEqual(embeds.shape, (1, 5, 64))
+
+    def test_text_plus_ref_shape(self):
+        model = self._make_model()
+        embeds = model.build_cond_embeds(
+            mx.zeros((1, 5), dtype=mx.int32),
+            mx.zeros((1, 7, 8), dtype=mx.int32),
+        )
+        self.assertEqual(embeds.shape, (1, 12, 64))  # S=5, T_ref=7
+
+    def test_uncond_no_ref(self):
+        model = self._make_model()
+        embeds = model.build_cond_embeds(mx.zeros((1, 5), dtype=mx.int32))
+        self.assertEqual(embeds.shape, (1, 5, 64))
 
 
 class TestOmniVoiceGeneration(unittest.TestCase):
@@ -153,8 +199,6 @@ class TestOmniVoiceGeneration(unittest.TestCase):
         self.assertAlmostEqual(ratios[32], 1.0, places=4)
 
     def test_iterative_unmask_no_mask_remaining(self):
-        from unittest.mock import MagicMock
-
         from mlx_audio.tts.models.omnivoice.config import OmniVoiceConfig
         from mlx_audio.tts.models.omnivoice.generation import iterative_unmask
         from mlx_audio.tts.models.omnivoice.omnivoice import Model
@@ -182,10 +226,12 @@ class TestOmniVoiceGeneration(unittest.TestCase):
 
         T = 10
         input_ids = mx.zeros((1, 3), dtype=mx.int32)
+        cond_embeds = model.build_cond_embeds(input_ids)
+        uncond_embeds = model.build_cond_embeds(mx.zeros_like(input_ids))
         tokens = iterative_unmask(
             model=model,
-            input_ids_cond=input_ids,
-            input_ids_uncond=input_ids,
+            cond_embeds=cond_embeds,
+            uncond_embeds=uncond_embeds,
             T=T,
             num_steps=5,  # fast test
             guidance_scale=2.0,

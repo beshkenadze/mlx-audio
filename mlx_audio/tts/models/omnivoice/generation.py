@@ -64,8 +64,8 @@ def _unmask_step(
 
 def iterative_unmask(
     model: "Model",
-    input_ids_cond: mx.array,  # [1, S_cond]
-    input_ids_uncond: mx.array,  # [1, S_uncond]
+    cond_embeds: mx.array,  # [1, S, D]
+    uncond_embeds: mx.array,  # [1, S, D]
     T: int,
     num_steps: int = 32,
     guidance_scale: float = 2.0,
@@ -74,25 +74,30 @@ def iterative_unmask(
 ) -> mx.array:  # [T, 8] in [0, 1023]
     """Run iterative unmasking decode for OmniVoice audio token generation.
 
-    NOTE: currently takes raw input_ids (token sequences) for the conditional
-    and unconditional branches. Phase 6 will refactor this signature to accept
-    pre-embedded cond_embeds/uncond_embeds (mx.array of shape [1, S, D]) to
-    support voice cloning — the embeddings will be computed once outside this
-    loop and injected directly into the model. This is a known gap blocked by
-    Phase 6 voice cloning work (spec §4.5).
+    Accepts pre-embedded conditioning (cond_embeds/uncond_embeds) so that
+    voice cloning prefix embeddings can be injected once before the loop.
     """
     C = model.config.num_audio_codebook
     tokens = mx.full((T, C), AUDIO_MASK_ID, dtype=mx.int32)
     frozen = mx.zeros((T, C), dtype=mx.bool_)
 
-    for step in range(num_steps):
-        # Batch conditional and unconditional for a single forward pass
-        tokens_batch = mx.stack([tokens, tokens], axis=0)  # [2, T, C]
-        input_ids_batch = mx.concatenate(
-            [input_ids_cond, input_ids_uncond], axis=0
-        )  # [2, S]
+    # Static prefix batch: [2, S, D] — computed once before the loop
+    prefix_batch = mx.concatenate([cond_embeds, uncond_embeds], axis=0)
+    prefix_len = cond_embeds.shape[1]
 
-        logits_batch = model(input_ids_batch, tokens_batch)  # [2, T, C, V]
+    for step in range(num_steps):
+        tokens_batch = mx.stack([tokens, tokens], axis=0)  # [2, T, C]
+
+        # Compute audio embeddings from current tokens
+        audio_embeds = sum(
+            model.audio_embeddings[i](tokens_batch[:, :, i]) for i in range(C)
+        )  # [2, T, D]
+
+        inputs_embeds = mx.concatenate(
+            [prefix_batch, audio_embeds], axis=1
+        )  # [2, S+T, D]
+
+        logits_batch = model(inputs_embeds, prefix_len=prefix_len)  # [2, T, C, V]
         logits_cond = logits_batch[0:1]  # [1, T, C, V]
         logits_uncond = logits_batch[1:2]  # [1, T, C, V]
 
