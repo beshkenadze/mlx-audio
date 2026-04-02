@@ -331,5 +331,24 @@ class TestOmniVoiceGenerate(unittest.TestCase):
         self.assertGreater(result.processing_time_seconds, 0)
 
 
+class TestVoiceCloneUtils(unittest.TestCase):
+    def _call(self):
+        from mlx_audio.tts.models.omnivoice.utils import create_voice_clone_prompt
+
+        return create_voice_clone_prompt("dummy.wav", ref_text="hello")
+
+    def test_create_voice_clone_prompt_returns_array(self):
+        result = self._call()
+        self.assertIsInstance(result, mx.array)
+
+    def test_create_voice_clone_prompt_shape(self):
+        result = self._call()
+        self.assertEqual(result.shape, (0, 8))
+
+    def test_create_voice_clone_prompt_dtype(self):
+        result = self._call()
+        self.assertEqual(result.dtype, mx.int32)
+
+
 if __name__ == "__main__":
     unittest.main()
