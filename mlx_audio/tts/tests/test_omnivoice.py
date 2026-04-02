@@ -307,16 +307,16 @@ class TestIterativeUnmaskRefactor(unittest.TestCase):
 
         model = self._make_model()
         input_ids = mx.zeros((1, 3), dtype=mx.int32)
-
-        mx.random.seed(42)
         cond = model.build_cond_embeds(input_ids)
         uncond = model.build_cond_embeds(mx.zeros_like(input_ids))
-        t1 = iterative_unmask(model, cond, uncond, T=5, num_steps=3)
 
         mx.random.seed(42)
-        cond2 = model.build_cond_embeds(input_ids)
-        uncond2 = model.build_cond_embeds(mx.zeros_like(input_ids))
-        t2 = iterative_unmask(model, cond2, uncond2, T=5, num_steps=3)
+        t1 = iterative_unmask(model, cond, uncond, T=5, num_steps=3)
+        # Force materialization before resetting the seed
+        _ = int(mx.sum(t1).item())
+
+        mx.random.seed(42)
+        t2 = iterative_unmask(model, cond, uncond, T=5, num_steps=3)
 
         self.assertTrue(bool(mx.all(t1 == t2).item()))
 
