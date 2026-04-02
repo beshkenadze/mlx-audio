@@ -42,5 +42,13 @@ class TestOmniVoiceConfig(unittest.TestCase):
         self.assertAlmostEqual(cfg.tokens_per_second, 75.0)
 
 
+class TestOmniVoiceRegistration(unittest.TestCase):
+    def test_model_type_registered(self):
+        from mlx_audio.tts.utils import MODEL_REMAPPING
+
+        self.assertIn("omnivoice", MODEL_REMAPPING)
+        self.assertEqual(MODEL_REMAPPING["omnivoice"], "omnivoice")
+
+
 if __name__ == "__main__":
     unittest.main()
