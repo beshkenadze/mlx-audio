@@ -50,5 +50,55 @@ class TestOmniVoiceRegistration(unittest.TestCase):
         self.assertEqual(MODEL_REMAPPING["omnivoice"], "omnivoice")
 
 
+class TestOmniVoiceBackbone(unittest.TestCase):
+    def _make_backbone(self):
+        from mlx_audio.tts.models.omnivoice.backbone import (
+            BackboneConfig,
+            OmniVoiceBackbone,
+        )
+
+        cfg = BackboneConfig(
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            intermediate_size=128,
+            vocab_size=151676,
+            head_dim=16,
+            rms_norm_eps=1e-6,
+        )
+        return OmniVoiceBackbone(cfg)
+
+    def test_output_shape(self):
+        model = self._make_backbone()
+        B, S = 1, 10
+        embeds = mx.zeros((B, S, 64))
+        out = model(embeds)
+        self.assertEqual(out.shape, (B, S, 64))
+
+    def test_bidirectional_no_causal_leak(self):
+        """Token at position 7 must influence output at position 3 (bidirectional)."""
+        import numpy as np
+
+        model = self._make_backbone()
+        S = 10
+        base_embeds = mx.zeros((1, S, 64))
+        # Perturb position 7
+        perturbed = mx.array(np.zeros((1, S, 64), dtype=np.float32))
+        perturbed_list = np.zeros((1, S, 64), dtype=np.float32)
+        perturbed_list[0, 7, :] = 1.0
+        perturbed = mx.array(perturbed_list)
+
+        out_base = model(base_embeds)
+        out_perturbed = model(perturbed)
+        # Position 3 output should differ (bidirectional attention)
+        diff = mx.abs(out_base[0, 3] - out_perturbed[0, 3])
+        self.assertGreater(
+            float(mx.max(diff).item()),
+            1e-6,
+            "Position 3 unchanged after perturbing pos 7 — causal mask still active!",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
