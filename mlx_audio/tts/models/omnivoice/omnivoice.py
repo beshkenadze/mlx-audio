@@ -103,11 +103,6 @@ class Model(nn.Module):
 
         cond_embeds = self.build_cond_embeds(input_ids_b, ref_b)
         uncond_embeds = self.build_cond_embeds(mx.zeros_like(input_ids_b))
-        # Pad uncond to match cond's prefix length with zeros
-        if cond_embeds.shape[1] > uncond_embeds.shape[1]:
-            pad_len = cond_embeds.shape[1] - uncond_embeds.shape[1]
-            pad = mx.zeros((1, pad_len, uncond_embeds.shape[2]))
-            uncond_embeds = mx.concatenate([uncond_embeds, pad], axis=1)
 
         start_time = time.time()
         tokens = iterative_unmask(

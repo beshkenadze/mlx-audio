@@ -64,8 +64,8 @@ def _unmask_step(
 
 def iterative_unmask(
     model: "Model",
-    cond_embeds: mx.array,  # [1, S, D]
-    uncond_embeds: mx.array,  # [1, S, D]
+    cond_embeds: mx.array,  # [1, S_cond, D]
+    uncond_embeds: mx.array,  # [1, S_uncond, D]  — may differ from S_cond
     T: int,
     num_steps: int = 32,
     guidance_scale: float = 2.0,
@@ -76,30 +76,61 @@ def iterative_unmask(
 
     Accepts pre-embedded conditioning (cond_embeds/uncond_embeds) so that
     voice cloning prefix embeddings can be injected once before the loop.
+
+    When cond and uncond have the same prefix length (no voice cloning), uses
+    a fast batched path. When they differ (voice cloning), runs two separate
+    forward passes to avoid padding the unconditional branch.
     """
     C = model.config.num_audio_codebook
     tokens = mx.full((T, C), AUDIO_MASK_ID, dtype=mx.int32)
     frozen = mx.zeros((T, C), dtype=mx.bool_)
 
-    # Static prefix batch: [2, S, D] — computed once before the loop
-    prefix_batch = mx.concatenate([cond_embeds, uncond_embeds], axis=0)
-    prefix_len = cond_embeds.shape[1]
+    cond_prefix_len = cond_embeds.shape[1]
+    uncond_prefix_len = uncond_embeds.shape[1]
+    same_prefix_len = cond_prefix_len == uncond_prefix_len
+
+    # Static prefix batch for the fast batched path: [2, S, D]
+    if same_prefix_len:
+        prefix_batch = mx.concatenate([cond_embeds, uncond_embeds], axis=0)
 
     for step in range(num_steps):
-        tokens_batch = mx.stack([tokens, tokens], axis=0)  # [2, T, C]
+        if same_prefix_len:
+            tokens_batch = mx.stack([tokens, tokens], axis=0)  # [2, T, C]
 
-        # Compute audio embeddings from current tokens
-        audio_embeds = sum(
-            model.audio_embeddings[i](tokens_batch[:, :, i]) for i in range(C)
-        )  # [2, T, D]
+            audio_embeds = sum(
+                model.audio_embeddings[i](tokens_batch[:, :, i]) for i in range(C)
+            )  # [2, T, D]
 
-        inputs_embeds = mx.concatenate(
-            [prefix_batch, audio_embeds], axis=1
-        )  # [2, S+T, D]
+            inputs_embeds = mx.concatenate(
+                [prefix_batch, audio_embeds], axis=1
+            )  # [2, S+T, D]
 
-        logits_batch = model(inputs_embeds, prefix_len=prefix_len)  # [2, T, C, V]
-        logits_cond = logits_batch[0:1]  # [1, T, C, V]
-        logits_uncond = logits_batch[1:2]  # [1, T, C, V]
+            logits_batch = model(
+                inputs_embeds, prefix_len=cond_prefix_len
+            )  # [2, T, C, V]
+            logits_cond = logits_batch[0:1]  # [1, T, C, V]
+            logits_uncond = logits_batch[1:2]  # [1, T, C, V]
+        else:
+            # Voice cloning: cond has ref audio prefix, uncond is text-only.
+            # Run two separate forward passes to avoid polluting uncond with padding.
+            audio_embeds_cond = sum(
+                model.audio_embeddings[i](tokens[None, :, i]) for i in range(C)
+            )  # [1, T, D]
+            audio_embeds_uncond = (
+                audio_embeds_cond  # same audio tokens, same embeddings
+            )
+
+            inputs_cond = mx.concatenate(
+                [cond_embeds, audio_embeds_cond], axis=1
+            )  # [1, S_cond+T, D]
+            inputs_uncond = mx.concatenate(
+                [uncond_embeds, audio_embeds_uncond], axis=1
+            )  # [1, S_uncond+T, D]
+
+            logits_cond = model(inputs_cond, prefix_len=cond_prefix_len)  # [1, T, C, V]
+            logits_uncond = model(
+                inputs_uncond, prefix_len=uncond_prefix_len
+            )  # [1, T, C, V]
 
         # Classifier-free guidance
         logits = logits_uncond + guidance_scale * (logits_cond - logits_uncond)
