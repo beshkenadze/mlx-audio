@@ -258,6 +258,69 @@ class TestOmniVoiceGeneration(unittest.TestCase):
         pass
 
 
+class TestIterativeUnmaskRefactor(unittest.TestCase):
+    def _make_model(self):
+        from mlx_audio.tts.models.omnivoice.config import OmniVoiceConfig
+        from mlx_audio.tts.models.omnivoice.omnivoice import Model
+
+        cfg = OmniVoiceConfig.from_dict(
+            {
+                "model_type": "omnivoice",
+                "audio_vocab_size": 1025,
+                "audio_mask_id": 1024,
+                "num_audio_codebook": 8,
+                "sample_rate": 24000,
+                "llm_config": {
+                    "hidden_size": 64,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "intermediate_size": 128,
+                    "vocab_size": 200,
+                    "head_dim": 16,
+                    "rms_norm_eps": 1e-6,
+                },
+            }
+        )
+        return Model(cfg)
+
+    def test_new_signature_shape(self):
+        from mlx_audio.tts.models.omnivoice.generation import iterative_unmask
+
+        model = self._make_model()
+        cond = mx.zeros((1, 3, 64))
+        uncond = mx.zeros((1, 3, 64))
+        tokens = iterative_unmask(model, cond, uncond, T=10, num_steps=2)
+        self.assertEqual(tokens.shape, (10, 8))
+
+    def test_no_mask_tokens_remain(self):
+        from mlx_audio.tts.models.omnivoice.generation import iterative_unmask
+
+        model = self._make_model()
+        cond = mx.zeros((1, 3, 64))
+        uncond = mx.zeros((1, 3, 64))
+        tokens = iterative_unmask(model, cond, uncond, T=10, num_steps=5)
+        self.assertEqual(int(mx.sum(tokens == 1024).item()), 0)
+
+    def test_deterministic_with_fixed_seed(self):
+        from mlx_audio.tts.models.omnivoice.generation import iterative_unmask
+
+        model = self._make_model()
+        input_ids = mx.zeros((1, 3), dtype=mx.int32)
+
+        mx.random.seed(42)
+        cond = model.build_cond_embeds(input_ids)
+        uncond = model.build_cond_embeds(mx.zeros_like(input_ids))
+        t1 = iterative_unmask(model, cond, uncond, T=5, num_steps=3)
+
+        mx.random.seed(42)
+        cond2 = model.build_cond_embeds(input_ids)
+        uncond2 = model.build_cond_embeds(mx.zeros_like(input_ids))
+        t2 = iterative_unmask(model, cond2, uncond2, T=5, num_steps=3)
+
+        self.assertTrue(bool(mx.all(t1 == t2).item()))
+
+
 class TestOmniVoiceSanitize(unittest.TestCase):
     def _make_model(self):
         from mlx_audio.tts.models.omnivoice.config import OmniVoiceConfig
