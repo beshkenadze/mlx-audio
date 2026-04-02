@@ -99,5 +99,48 @@ class TestOmniVoiceBackbone(unittest.TestCase):
         )
 
 
+class TestOmniVoiceModel(unittest.TestCase):
+    def _make_model(self):
+        from mlx_audio.tts.models.omnivoice.config import OmniVoiceConfig
+        from mlx_audio.tts.models.omnivoice.omnivoice import Model
+
+        cfg = OmniVoiceConfig.from_dict(
+            {
+                "model_type": "omnivoice",
+                "audio_vocab_size": 1025,
+                "audio_mask_id": 1024,
+                "num_audio_codebook": 8,
+                "sample_rate": 24000,
+                "llm_config": {
+                    "hidden_size": 64,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "intermediate_size": 128,
+                    "vocab_size": 200,
+                    "head_dim": 16,
+                    "rms_norm_eps": 1e-6,
+                },
+            }
+        )
+        return Model(cfg)
+
+    def test_logits_shape(self):
+        model = self._make_model()
+        B, S, T = 1, 5, 7
+        input_ids = mx.zeros((B, S), dtype=mx.int32)
+        audio_tokens = mx.full((B, T, 8), 1024, dtype=mx.int32)  # all masked
+        logits = model(input_ids, audio_tokens)
+        self.assertEqual(logits.shape, (B, T, 8, 1025))
+
+    def test_embed_shape(self):
+        model = self._make_model()
+        B, S, T = 1, 5, 7
+        input_ids = mx.zeros((B, S), dtype=mx.int32)
+        audio_tokens = mx.full((B, T, 8), 1024, dtype=mx.int32)
+        embeds = model._embed(input_ids, audio_tokens)
+        self.assertEqual(embeds.shape, (B, S + T, 64))  # hidden_size=64 in test cfg
+
+
 if __name__ == "__main__":
     unittest.main()
