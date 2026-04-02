@@ -1,8 +1,11 @@
-from typing import List, Optional
+import math
+import time
+from typing import TYPE_CHECKING, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..base import GenerationResult
 from .backbone import BackboneConfig, OmniVoiceBackbone
 from .config import OmniVoiceConfig
 
@@ -68,6 +71,47 @@ class Model(nn.Module):
             axis=2,
         )  # [B, T, 8, V]
         return logits
+
+    def generate(
+        self,
+        input_ids: mx.array,
+        duration_s: float,
+        num_steps: int = 32,
+        guidance_scale: float = 2.0,
+        temperature: float = 5.0,
+    ) -> GenerationResult:
+        from .generation import iterative_unmask
+
+        T = math.ceil(duration_s * self.config.sample_rate / 320)
+        input_ids = input_ids[None]  # [1, S]
+        S = input_ids.shape[1]
+        input_ids_uncond = mx.zeros((1, S), dtype=mx.int32)
+
+        start_time = time.time()
+        tokens = iterative_unmask(
+            self,
+            input_ids_cond=input_ids,
+            input_ids_uncond=input_ids_uncond,
+            T=T,
+            num_steps=num_steps,
+            guidance_scale=guidance_scale,
+            temperature=temperature,
+        )
+        processing_time_seconds = time.time() - start_time
+
+        return GenerationResult(
+            audio=None,
+            samples=0,
+            sample_rate=self.config.sample_rate,
+            segment_idx=0,
+            token_count=T,
+            audio_duration=duration_s,
+            real_time_factor=0.0,
+            prompt="",
+            audio_samples=tokens.tolist(),
+            processing_time_seconds=processing_time_seconds,
+            peak_memory_usage=0,
+        )
 
     def sanitize(self, weights: dict) -> dict:
         result = {}

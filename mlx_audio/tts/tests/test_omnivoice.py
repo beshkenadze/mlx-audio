@@ -273,5 +273,63 @@ class TestOmniVoiceSanitize(unittest.TestCase):
         self.assertIn("some.other.key", result)
 
 
+class TestOmniVoiceGenerate(unittest.TestCase):
+    def _make_model(self):
+        from mlx_audio.tts.models.omnivoice.config import OmniVoiceConfig
+        from mlx_audio.tts.models.omnivoice.omnivoice import Model
+
+        cfg = OmniVoiceConfig.from_dict(
+            {
+                "model_type": "omnivoice",
+                "audio_vocab_size": 1025,
+                "audio_mask_id": 1024,
+                "num_audio_codebook": 8,
+                "sample_rate": 24000,
+                "llm_config": {
+                    "hidden_size": 64,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "intermediate_size": 128,
+                    "vocab_size": 200,
+                    "head_dim": 16,
+                    "rms_norm_eps": 1e-6,
+                },
+            }
+        )
+        return Model(cfg)
+
+    def test_generate_returns_generation_result(self):
+        import math
+
+        from mlx_audio.tts.models.base import GenerationResult
+
+        model = self._make_model()
+        input_ids = mx.zeros((5,), dtype=mx.int32)
+        result = model.generate(input_ids, duration_s=1.0, num_steps=5)
+        self.assertIsInstance(result, GenerationResult)
+
+    def test_generate_token_count(self):
+        import math
+
+        model = self._make_model()
+        input_ids = mx.zeros((5,), dtype=mx.int32)
+        result = model.generate(input_ids, duration_s=1.0, num_steps=5)
+        expected_T = math.ceil(1.0 * 24000 / 320)  # = 75
+        self.assertEqual(result.token_count, expected_T)
+
+    def test_generate_sample_rate(self):
+        model = self._make_model()
+        input_ids = mx.zeros((5,), dtype=mx.int32)
+        result = model.generate(input_ids, duration_s=1.0, num_steps=5)
+        self.assertEqual(result.sample_rate, 24000)
+
+    def test_generate_processing_time_positive(self):
+        model = self._make_model()
+        input_ids = mx.zeros((5,), dtype=mx.int32)
+        result = model.generate(input_ids, duration_s=1.0, num_steps=5)
+        self.assertGreater(result.processing_time_seconds, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
