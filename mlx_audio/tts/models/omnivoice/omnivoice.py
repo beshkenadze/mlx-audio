@@ -69,6 +69,21 @@ class Model(nn.Module):
         )  # [B, T, 8, V]
         return logits
 
+    def sanitize(self, weights: dict) -> dict:
+        result = {}
+        for key, value in weights.items():
+            if key.startswith("lm_head."):
+                continue
+            elif key.startswith("model."):
+                result["backbone." + key[len("model.") :]] = value
+            elif key.startswith("audio_embed."):
+                result["audio_embeddings." + key[len("audio_embed.") :]] = value
+            elif key.startswith("audio_head."):
+                result["audio_heads." + key[len("audio_head.") :]] = value
+            else:
+                result[key] = value
+        return result
+
     @property
     def model_type(self) -> str:
         return self.config.model_type

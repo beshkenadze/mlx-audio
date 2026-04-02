@@ -212,5 +212,66 @@ class TestOmniVoiceGeneration(unittest.TestCase):
         pass
 
 
+class TestOmniVoiceSanitize(unittest.TestCase):
+    def _make_model(self):
+        from mlx_audio.tts.models.omnivoice.config import OmniVoiceConfig
+        from mlx_audio.tts.models.omnivoice.omnivoice import Model
+
+        cfg = OmniVoiceConfig.from_dict(
+            {
+                "model_type": "omnivoice",
+                "audio_vocab_size": 1025,
+                "audio_mask_id": 1024,
+                "num_audio_codebook": 8,
+                "sample_rate": 24000,
+                "llm_config": {
+                    "hidden_size": 64,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "intermediate_size": 128,
+                    "vocab_size": 200,
+                    "head_dim": 16,
+                    "rms_norm_eps": 1e-6,
+                },
+            }
+        )
+        return Model(cfg)
+
+    def test_model_prefix_remapped(self):
+        model = self._make_model()
+        x = mx.zeros((4,))
+        result = model.sanitize({"model.layers.0.weight": x})
+        self.assertIn("backbone.layers.0.weight", result)
+        self.assertNotIn("model.layers.0.weight", result)
+
+    def test_audio_embed_remapped(self):
+        model = self._make_model()
+        x = mx.zeros((4,))
+        result = model.sanitize({"audio_embed.0.weight": x})
+        self.assertIn("audio_embeddings.0.weight", result)
+        self.assertNotIn("audio_embed.0.weight", result)
+
+    def test_audio_head_remapped(self):
+        model = self._make_model()
+        x = mx.zeros((4,))
+        result = model.sanitize({"audio_head.0.weight": x})
+        self.assertIn("audio_heads.0.weight", result)
+        self.assertNotIn("audio_head.0.weight", result)
+
+    def test_lm_head_dropped(self):
+        model = self._make_model()
+        x = mx.zeros((4,))
+        result = model.sanitize({"lm_head.weight": x})
+        self.assertNotIn("lm_head.weight", result)
+        self.assertEqual(len(result), 0)
+
+    def test_other_keys_pass_through(self):
+        model = self._make_model()
+        x = mx.zeros((4,))
+        result = model.sanitize({"some.other.key": x})
+        self.assertIn("some.other.key", result)
+
+
 if __name__ == "__main__":
     unittest.main()
