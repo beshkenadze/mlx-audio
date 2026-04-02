@@ -51,7 +51,7 @@ class Attention(nn.Module):
         )
         self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
-        self.rope = nn.RoPE(self.head_dim, base=config.rope_theta)
+        self.rope = nn.RoPE(self.head_dim, traditional=False, base=config.rope_theta)
 
     def __call__(self, x: mx.array) -> mx.array:
         B, S, _ = x.shape
@@ -126,6 +126,9 @@ class OmniVoiceBackbone(nn.Module):
         inputs_embeds: mx.array,
         attention_mask: Optional[mx.array] = None,
     ) -> mx.array:
+        assert (
+            attention_mask is None
+        ), "Padding masks not supported in bidirectional NAR backbone"
         h = inputs_embeds
         for layer in self.layers:
             h = layer(h)

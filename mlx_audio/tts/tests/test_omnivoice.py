@@ -84,7 +84,6 @@ class TestOmniVoiceBackbone(unittest.TestCase):
         S = 10
         base_embeds = mx.zeros((1, S, 64))
         # Perturb position 7
-        perturbed = mx.array(np.zeros((1, S, 64), dtype=np.float32))
         perturbed_list = np.zeros((1, S, 64), dtype=np.float32)
         perturbed_list[0, 7, :] = 1.0
         perturbed = mx.array(perturbed_list)
