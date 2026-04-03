@@ -55,28 +55,65 @@ class TestHiggsAudioTokenizer(unittest.TestCase):
         tokenizer = HiggsAudioTokenizer(HiggsAudioConfig())
         self.assertIsNotNone(tokenizer)
 
-    def test_higgs_audio_decode_raises_not_implemented(self):
-        from mlx_audio.codec.models.higgs_audio import (
-            HiggsAudioConfig,
-            HiggsAudioTokenizer,
-        )
-
-        tokenizer = HiggsAudioTokenizer(HiggsAudioConfig())
-        tokens = mx.zeros((10, 8), dtype=mx.int32)
-        with self.assertRaises(NotImplementedError):
-            tokenizer.decode(tokens)
-
-    def test_higgs_audio_from_pretrained_raises_not_implemented(self):
-        from mlx_audio.codec.models.higgs_audio import HiggsAudioTokenizer
-
-        with self.assertRaises(NotImplementedError):
-            HiggsAudioTokenizer.from_pretrained("/tmp")
-
     def test_higgs_audio_config_tokens_per_second(self):
         from mlx_audio.codec.models.higgs_audio import HiggsAudioConfig
 
         cfg = HiggsAudioConfig()
-        self.assertAlmostEqual(cfg.tokens_per_second, 75.0)
+        self.assertAlmostEqual(cfg.tokens_per_second, 25.0)
+
+
+class TestHiggsAudioTokenizerFull(unittest.TestCase):
+    def _tok(self):
+        from mlx_audio.codec.models.higgs_audio.config import HiggsAudioConfig
+        from mlx_audio.codec.models.higgs_audio.higgs_audio import HiggsAudioTokenizer
+
+        return HiggsAudioTokenizer(HiggsAudioConfig())
+
+    def test_instantiation(self):
+        self.assertIsNotNone(self._tok())
+
+    def test_decode_2d_shape(self):
+        tok = self._tok()
+        tokens = mx.zeros((4, 8), dtype=mx.int32)
+        wav = tok.decode(tokens)
+        self.assertEqual(wav.shape, (4 * 960,))
+
+    def test_decode_3d_shape(self):
+        tok = self._tok()
+        tokens = mx.zeros((1, 4, 8), dtype=mx.int32)
+        wav = tok.decode(tokens)
+        self.assertEqual(wav.ndim, 3)
+        self.assertEqual(wav.shape[0], 1)
+        self.assertEqual(wav.shape[2], 1)
+
+    def test_encode_shape(self):
+        tok = self._tok()
+        # 960*5 input produces 4 output tokens (encoder has padding overhead)
+        wav = mx.zeros((1, 960 * 5, 1))
+        tokens = tok.encode(wav)
+        self.assertEqual(tokens.shape[0], 1)
+        self.assertEqual(tokens.shape[2], 8)
+        self.assertEqual(tokens.dtype, mx.int32)
+
+    def test_sanitize_drops_semantic(self):
+        tok = self._tok()
+        weights = {
+            "acoustic_encoder.conv1.weight_g": mx.zeros((1,)),
+            "semantic_model.encoder.conv.weight": mx.zeros((1,)),
+            "fc2.weight": mx.zeros((256, 1024)),
+            "fc1.weight": mx.zeros((768, 1024)),
+        }
+        result = tok.sanitize(weights)
+        self.assertIn("acoustic_encoder.conv1.weight_g", result)
+        self.assertIn("fc2.weight", result)
+        self.assertNotIn("semantic_model.encoder.conv.weight", result)
+        self.assertNotIn("fc1.weight", result)
+
+    def test_from_pretrained_missing_raises(self):
+        from mlx_audio.codec.models.higgs_audio.higgs_audio import HiggsAudioTokenizer
+
+        with self.assertRaises(FileNotFoundError):
+            HiggsAudioTokenizer.from_pretrained("/nonexistent/path")
 
 
 if __name__ == "__main__":
