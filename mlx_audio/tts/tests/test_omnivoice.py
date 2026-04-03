@@ -466,22 +466,43 @@ class TestOmniVoiceGenerate(unittest.TestCase):
 
 
 class TestVoiceCloneUtils(unittest.TestCase):
-    def _call(self):
+    def test_no_tokenizer_returns_empty(self):
         from mlx_audio.tts.models.omnivoice.utils import create_voice_clone_prompt
 
-        return create_voice_clone_prompt("dummy.wav", ref_text="hello")
-
-    def test_create_voice_clone_prompt_returns_array(self):
-        result = self._call()
-        self.assertIsInstance(result, mx.array)
-
-    def test_create_voice_clone_prompt_shape(self):
-        result = self._call()
+        result = create_voice_clone_prompt("any_path.wav", tokenizer=None)
         self.assertEqual(result.shape, (0, 8))
-
-    def test_create_voice_clone_prompt_dtype(self):
-        result = self._call()
         self.assertEqual(result.dtype, mx.int32)
+
+    def test_missing_file_raises(self):
+        from mlx_audio.codec.models.higgs_audio.config import HiggsAudioConfig
+        from mlx_audio.codec.models.higgs_audio.higgs_audio import HiggsAudioTokenizer
+        from mlx_audio.tts.models.omnivoice.utils import create_voice_clone_prompt
+
+        tok = HiggsAudioTokenizer(HiggsAudioConfig())
+        with self.assertRaises(FileNotFoundError):
+            create_voice_clone_prompt("/nonexistent/file.wav", tokenizer=tok)
+
+    def test_with_tokenizer_returns_2d(self):
+        import os
+        import tempfile
+
+        import numpy as np
+        import soundfile as sf
+
+        from mlx_audio.codec.models.higgs_audio.config import HiggsAudioConfig
+        from mlx_audio.codec.models.higgs_audio.higgs_audio import HiggsAudioTokenizer
+        from mlx_audio.tts.models.omnivoice.utils import create_voice_clone_prompt
+
+        tok = HiggsAudioTokenizer(HiggsAudioConfig())
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            tmp_path = f.name
+        audio = np.zeros(24000 * 2, dtype=np.float32)  # 2 seconds
+        sf.write(tmp_path, audio, 24000)
+        result = create_voice_clone_prompt(tmp_path, tokenizer=tok)
+        self.assertEqual(result.ndim, 2)
+        self.assertEqual(result.shape[1], 8)
+        self.assertEqual(result.dtype, mx.int32)
+        os.unlink(tmp_path)
 
 
 if __name__ == "__main__":
