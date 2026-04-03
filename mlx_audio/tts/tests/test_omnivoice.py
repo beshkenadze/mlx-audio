@@ -505,5 +505,61 @@ class TestVoiceCloneUtils(unittest.TestCase):
         os.unlink(tmp_path)
 
 
+class TestOmniVoiceGenerateWithTokenizer(unittest.TestCase):
+    def _make_model(self):
+        from mlx_audio.tts.models.omnivoice.config import OmniVoiceConfig
+        from mlx_audio.tts.models.omnivoice.omnivoice import Model
+
+        cfg = OmniVoiceConfig.from_dict(
+            {
+                "model_type": "omnivoice",
+                "audio_vocab_size": 1025,
+                "audio_mask_id": 1024,
+                "num_audio_codebook": 8,
+                "sample_rate": 24000,
+                "llm_config": {
+                    "hidden_size": 64,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "intermediate_size": 128,
+                    "vocab_size": 200,
+                    "head_dim": 16,
+                    "rms_norm_eps": 1e-6,
+                },
+            }
+        )
+        return Model(cfg)
+
+    def _make_tokenizer(self):
+        from mlx_audio.codec.models.higgs_audio.config import HiggsAudioConfig
+        from mlx_audio.codec.models.higgs_audio.higgs_audio import HiggsAudioTokenizer
+
+        return HiggsAudioTokenizer(HiggsAudioConfig())
+
+    def test_audio_is_none_without_tokenizer(self):
+        model = self._make_model()
+        input_ids = mx.zeros((5,), dtype=mx.int32)
+        result = model.generate(input_ids, duration_s=0.1, num_steps=2)
+        self.assertIsNone(result.audio)
+
+    def test_audio_is_array_with_tokenizer(self):
+        model = self._make_model()
+        tok = self._make_tokenizer()
+        input_ids = mx.zeros((5,), dtype=mx.int32)
+        result = model.generate(input_ids, duration_s=0.1, num_steps=2, tokenizer=tok)
+        self.assertIsNotNone(result.audio)
+        self.assertIsInstance(result.audio, mx.array)
+
+    def test_samples_count_with_tokenizer(self):
+        model = self._make_model()
+        tok = self._make_tokenizer()
+        input_ids = mx.zeros((5,), dtype=mx.int32)
+        result = model.generate(input_ids, duration_s=0.1, num_steps=2, tokenizer=tok)
+        # tokens is [T, 8]; decode returns [T*960] 1D
+        expected_samples = result.token_count * 960
+        self.assertEqual(result.audio.size, expected_samples)
+
+
 if __name__ == "__main__":
     unittest.main()

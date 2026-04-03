@@ -94,6 +94,7 @@ class Model(nn.Module):
         num_steps: int = 32,
         guidance_scale: float = 2.0,
         temperature: float = 5.0,
+        tokenizer=None,
     ) -> GenerationResult:
         from .generation import iterative_unmask
 
@@ -116,8 +117,13 @@ class Model(nn.Module):
         )
         processing_time_seconds = time.time() - start_time
 
+        if tokenizer is not None:
+            audio = tokenizer.decode(tokens)  # [T*960] 1D for 2D tokens input
+        else:
+            audio = None
+
         return GenerationResult(
-            audio=None,
+            audio=audio,
             samples=0,
             sample_rate=self.config.sample_rate,
             segment_idx=0,
