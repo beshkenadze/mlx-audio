@@ -1065,17 +1065,16 @@ class Model(nn.Module):
             if override and os.path.isdir(override):
                 model_path = override
             else:
-                model_path = os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)),
-                    "..", "..", "..", "vad", "models", "silero",
-                    "silero_vad_v6_256ms.mlpackage",
+                from huggingface_hub import snapshot_download
+                cache_dir = os.path.expanduser(
+                    "~/.cache/mlx-audio/vad/silero-vad-coreml-mlx-audio"
                 )
-                model_path = os.path.normpath(model_path)
-                if not os.path.isdir(model_path):
-                    raise FileNotFoundError(
-                        f"silero-coreml mlpackage not found at {model_path}. "
-                        "Set MLX_AUDIO_SILERO_COREML to a local mlpackage path."
-                    )
+                snapshot_root = snapshot_download(
+                    repo_id="beshkenadze/silero-vad-coreml-mlx-audio",
+                    allow_patterns=["silero_vad_v6_256ms.mlpackage/**"],
+                    local_dir=cache_dir,
+                )
+                model_path = os.path.join(snapshot_root, "silero_vad_v6_256ms.mlpackage")
             self._silero_coreml_model = ct.models.MLModel(model_path)
 
         m = self._silero_coreml_model
