@@ -856,6 +856,7 @@ class Model(nn.Module):
             current_tokens = mx.argmax(logits[:, -1, :], axis=-1).astype(mx.int32)
             token_steps.append(current_tokens)
             finished = finished | (current_tokens == eos_mx)
+            mx.eval(current_tokens, finished)
 
         all_tokens_np = np.asarray(mx.stack(token_steps, axis=1))
 
