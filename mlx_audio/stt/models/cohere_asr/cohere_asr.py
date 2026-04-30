@@ -682,10 +682,12 @@ class Model(nn.Module):
 
     def make_cache(self):
         n_layers = len(self.transf_decoder.decoder.layers)
-        return [
-            {"self_attn": KVCache(), "cross_attn": (None, None)}
-            for _ in range(n_layers)
-        ]
+        caches = []
+        for _ in range(n_layers):
+            kv = KVCache()
+            kv.step = 512
+            caches.append({"self_attn": kv, "cross_attn": (None, None)})
+        return caches
 
     @property
     def sample_rate(self) -> int:
@@ -885,6 +887,9 @@ class Model(nn.Module):
 
         texts = [""] * len(waveforms)
         generation_counts = [0] * len(waveforms)
+
+        if batch_size < len(order):
+            batch_size = len(order)
 
         for start in range(0, len(order), batch_size):
             batch_indices = order[start : start + batch_size]
