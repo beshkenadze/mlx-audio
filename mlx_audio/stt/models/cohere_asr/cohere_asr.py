@@ -888,9 +888,6 @@ class Model(nn.Module):
         texts = [""] * len(waveforms)
         generation_counts = [0] * len(waveforms)
 
-        if batch_size < len(order):
-            batch_size = len(order)
-
         for start in range(0, len(order), batch_size):
             batch_indices = order[start : start + batch_size]
             batch_waveforms = [waveforms[idx] for idx in batch_indices]
