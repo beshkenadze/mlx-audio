@@ -889,6 +889,17 @@ class Model(nn.Module):
         texts = [""] * len(waveforms)
         generation_counts = [0] * len(waveforms)
 
+        max_safe_bytes = getattr(self.config, "max_safe_bytes", 0)
+        if max_safe_bytes > 0 and order:
+            longest_samples = waveforms[order[0]].shape[0]
+            hop = self.config.preprocessor.hop_length
+            t_mel = (longest_samples // hop) + 1
+            n_heads = self.config.encoder.n_heads
+            bytes_per_chunk = n_heads * t_mel * t_mel * 2
+            safe_bs = max(1, max_safe_bytes // max(bytes_per_chunk, 1))
+            if safe_bs < batch_size:
+                batch_size = safe_bs
+
         for start in range(0, len(order), batch_size):
             batch_indices = order[start : start + batch_size]
             batch_waveforms = [waveforms[idx] for idx in batch_indices]
