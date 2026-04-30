@@ -1061,28 +1061,21 @@ class Model(nn.Module):
 
         if not hasattr(self, "_silero_coreml_model"):
             import os
-            local = os.environ.get("MLX_AUDIO_SILERO_COREML")
-            if local and os.path.isdir(local):
-                model_path = local
+            override = os.environ.get("MLX_AUDIO_SILERO_COREML")
+            if override and os.path.isdir(override):
+                model_path = override
             else:
-                from huggingface_hub import hf_hub_download
-                base = "silero-vad-unified-256ms-v6.0.0.mlpackage"
-                files = [
-                    f"{base}/Manifest.json",
-                    f"{base}/Data/com.apple.CoreML/model.mlmodel",
-                    f"{base}/Data/com.apple.CoreML/weights/weight.bin",
-                ]
-                for f in files:
-                    hf_hub_download(
-                        repo_id="FluidInference/silero-vad-coreml",
-                        filename=f,
-                    )
-                from huggingface_hub import snapshot_download
-                snapshot_root = snapshot_download(
-                    repo_id="FluidInference/silero-vad-coreml",
-                    allow_patterns=[f"{base}/**"],
+                model_path = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "..", "..", "..", "vad", "models", "silero",
+                    "silero_vad_v6_256ms.mlpackage",
                 )
-                model_path = os.path.join(snapshot_root, base)
+                model_path = os.path.normpath(model_path)
+                if not os.path.isdir(model_path):
+                    raise FileNotFoundError(
+                        f"silero-coreml mlpackage not found at {model_path}. "
+                        "Set MLX_AUDIO_SILERO_COREML to a local mlpackage path."
+                    )
             self._silero_coreml_model = ct.models.MLModel(model_path)
 
         m = self._silero_coreml_model
@@ -1150,60 +1143,6 @@ class Model(nn.Module):
 
         merged = [list(runs_seconds[0])]
         for s, e in runs_seconds[1:]:
-            prev_s, prev_e = merged[-1]
-            gap = s - prev_e
-            merged_dur = e - prev_s
-            if gap <= merge_gap_s and merged_dur <= max_chunk_s:
-                merged[-1][1] = e
-            else:
-                merged.append([s, e])
-
-        segment_waveforms = []
-        segment_meta = []
-        for chunk_idx, (s, e) in enumerate(merged):
-            start_idx = int(s * sr)
-            end_idx = int(e * sr)
-            segment_waveforms.append(waveform[start_idx:end_idx].copy())
-            segment_meta.append({
-                "sample_idx": 0, "chunk_idx": chunk_idx,
-                "start": s, "end": e,
-            })
-        return segment_waveforms, segment_meta
-
-    def _prepare_segments_silero(
-        self,
-        waveform: np.ndarray,
-        *,
-        merge_gap_s: float = 0.7,
-        max_chunk_s: float = 30.0,
-    ) -> Tuple[List[np.ndarray], List[Dict[str, Union[int, float, None]]]]:
-        try:
-            import torch
-            from silero_vad import load_silero_vad, get_speech_timestamps
-        except ImportError as exc:
-            raise ImportError(
-                "vad='silero' requires silero-vad. Install with: pip install silero-vad"
-            ) from exc
-
-        sr = self.sample_rate
-        if sr != 16000:
-            raise ValueError(f"silero VAD requires 16kHz, got {sr}")
-
-        if not hasattr(self, "_silero_model"):
-            self._silero_model = load_silero_vad()
-
-        audio_t = torch.from_numpy(waveform.astype(np.float32))
-        ts = get_speech_timestamps(
-            audio_t, self._silero_model,
-            sampling_rate=sr, return_seconds=True,
-        )
-        if not ts:
-            return [waveform], [{"sample_idx": 0, "chunk_idx": 0,
-                                  "start": 0.0, "end": waveform.shape[0] / sr}]
-
-        merged = [[ts[0]["start"], ts[0]["end"]]]
-        for t in ts[1:]:
-            s, e = t["start"], t["end"]
             prev_s, prev_e = merged[-1]
             gap = s - prev_e
             merged_dur = e - prev_s
@@ -1396,12 +1335,6 @@ class Model(nn.Module):
             )
         elif vad_backend == "silero-coreml":
             segment_waveforms, segment_meta = self._prepare_segments_silero_coreml(
-                waveform,
-                merge_gap_s=vad_merge_gap_s,
-                max_chunk_s=vad_max_chunk_s,
-            )
-        elif vad_backend == "silero":
-            segment_waveforms, segment_meta = self._prepare_segments_silero(
                 waveform,
                 merge_gap_s=vad_merge_gap_s,
                 max_chunk_s=vad_max_chunk_s,
