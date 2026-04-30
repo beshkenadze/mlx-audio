@@ -961,6 +961,139 @@ class Model(nn.Module):
 
         return segment_waveforms, segment_meta
 
+    def _prepare_segments_silero_coreml(
+        self,
+        waveform: np.ndarray,
+        *,
+        merge_gap_s: float = 0.7,
+        max_chunk_s: float = 30.0,
+        threshold: float = 0.5,
+        min_speech_duration_ms: int = 250,
+        min_silence_duration_ms: int = 100,
+        speech_pad_ms: int = 30,
+    ) -> Tuple[List[np.ndarray], List[Dict[str, Union[int, float, None]]]]:
+        try:
+            import coremltools as ct
+        except ImportError as exc:
+            raise ImportError(
+                "vad='silero-coreml' requires coremltools. Install with: pip install coremltools"
+            ) from exc
+
+        sr = self.sample_rate
+        if sr != 16000:
+            raise ValueError(f"silero CoreML VAD requires 16kHz, got {sr}")
+
+        if not hasattr(self, "_silero_coreml_model"):
+            import os
+            local = os.environ.get("MLX_AUDIO_SILERO_COREML")
+            if local and os.path.isdir(local):
+                model_path = local
+            else:
+                from huggingface_hub import hf_hub_download
+                base = "silero-vad-unified-256ms-v6.0.0.mlpackage"
+                files = [
+                    f"{base}/Manifest.json",
+                    f"{base}/Data/com.apple.CoreML/model.mlmodel",
+                    f"{base}/Data/com.apple.CoreML/weights/weight.bin",
+                ]
+                for f in files:
+                    hf_hub_download(
+                        repo_id="FluidInference/silero-vad-coreml",
+                        filename=f,
+                    )
+                from huggingface_hub import snapshot_download
+                snapshot_root = snapshot_download(
+                    repo_id="FluidInference/silero-vad-coreml",
+                    allow_patterns=[f"{base}/**"],
+                )
+                model_path = os.path.join(snapshot_root, base)
+            self._silero_coreml_model = ct.models.MLModel(model_path)
+
+        m = self._silero_coreml_model
+        chunk_total = 4096
+        ctx_size = 64
+        chunks_per_block = 8
+        block_dur_s = chunks_per_block * 512 / sr
+
+        audio = waveform.astype(np.float32)
+        pad = chunk_total - len(audio) % chunk_total
+        if pad and pad < chunk_total:
+            audio = np.concatenate([audio, np.zeros(pad, dtype=np.float32)])
+        n_blocks = len(audio) // chunk_total
+
+        h = np.zeros((1, 128), dtype=np.float32)
+        c = np.zeros((1, 128), dtype=np.float32)
+        context = np.zeros(ctx_size, dtype=np.float32)
+        block_probs = np.zeros(n_blocks, dtype=np.float32)
+        for i in range(n_blocks):
+            block = audio[i * chunk_total : (i + 1) * chunk_total]
+            with_ctx = np.concatenate([context, block])[None, :].astype(np.float32)
+            out = m.predict({
+                "audio_input": with_ctx,
+                "hidden_state": h,
+                "cell_state": c,
+            })
+            block_probs[i] = out["vad_output"].flatten()[0]
+            h = out["new_hidden_state"]
+            c = out["new_cell_state"]
+            context = block[-ctx_size:]
+
+        speech_pad_blocks = max(0, int(speech_pad_ms / 1000 / block_dur_s))
+        min_speech_blocks = max(1, int(min_speech_duration_ms / 1000 / block_dur_s))
+        min_silence_blocks = max(1, int(min_silence_duration_ms / 1000 / block_dur_s))
+
+        runs = []
+        in_speech = False
+        seg_start = 0
+        silent_run = 0
+        for idx, p in enumerate(block_probs):
+            if p >= threshold:
+                if not in_speech:
+                    seg_start = max(0, idx - speech_pad_blocks)
+                    in_speech = True
+                silent_run = 0
+            else:
+                if in_speech:
+                    silent_run += 1
+                    if silent_run >= min_silence_blocks:
+                        seg_end = idx - silent_run + speech_pad_blocks
+                        if seg_end - seg_start >= min_speech_blocks:
+                            runs.append((seg_start, seg_end))
+                        in_speech = False
+                        silent_run = 0
+        if in_speech:
+            if n_blocks - seg_start >= min_speech_blocks:
+                runs.append((seg_start, n_blocks))
+
+        runs_seconds = [
+            (s * chunk_total / sr, e * chunk_total / sr) for s, e in runs
+        ]
+        if not runs_seconds:
+            return [waveform], [{"sample_idx": 0, "chunk_idx": 0,
+                                  "start": 0.0, "end": waveform.shape[0] / sr}]
+
+        merged = [list(runs_seconds[0])]
+        for s, e in runs_seconds[1:]:
+            prev_s, prev_e = merged[-1]
+            gap = s - prev_e
+            merged_dur = e - prev_s
+            if gap <= merge_gap_s and merged_dur <= max_chunk_s:
+                merged[-1][1] = e
+            else:
+                merged.append([s, e])
+
+        segment_waveforms = []
+        segment_meta = []
+        for chunk_idx, (s, e) in enumerate(merged):
+            start_idx = int(s * sr)
+            end_idx = int(e * sr)
+            segment_waveforms.append(waveform[start_idx:end_idx].copy())
+            segment_meta.append({
+                "sample_idx": 0, "chunk_idx": chunk_idx,
+                "start": s, "end": e,
+            })
+        return segment_waveforms, segment_meta
+
     def _prepare_segments_silero(
         self,
         waveform: np.ndarray,
@@ -1178,8 +1311,14 @@ class Model(nn.Module):
         start_time = time.time()
         self._validate_language(language)
         waveform = self._to_mono(audio, sample_rate=sample_rate)
-        vad_backend = "webrtc" if vad is True else (vad if isinstance(vad, str) else None)
-        if vad_backend == "silero":
+        vad_backend = "silero-coreml" if vad is True else (vad if isinstance(vad, str) else None)
+        if vad_backend == "silero-coreml":
+            segment_waveforms, segment_meta = self._prepare_segments_silero_coreml(
+                waveform,
+                merge_gap_s=vad_merge_gap_s,
+                max_chunk_s=vad_max_chunk_s,
+            )
+        elif vad_backend == "silero":
             segment_waveforms, segment_meta = self._prepare_segments_silero(
                 waveform,
                 merge_gap_s=vad_merge_gap_s,
