@@ -961,6 +961,82 @@ class Model(nn.Module):
 
         return segment_waveforms, segment_meta
 
+    def _prepare_segments_ten_vad(
+        self,
+        waveform: np.ndarray,
+        *,
+        merge_gap_s: float = 0.7,
+        max_chunk_s: float = 30.0,
+        threshold: float = 0.5,
+        hop_size: int = 256,
+        min_speech_duration_ms: int = 250,
+    ) -> Tuple[List[np.ndarray], List[Dict[str, Union[int, float, None]]]]:
+        try:
+            from ten_vad import TenVad
+        except ImportError as exc:
+            raise ImportError(
+                "vad='ten' requires ten-vad. "
+                "Install: pip install git+https://github.com/TEN-framework/ten-vad.git"
+            ) from exc
+
+        sr = self.sample_rate
+        if sr != 16000:
+            raise ValueError(f"TEN-VAD requires 16kHz, got {sr}")
+
+        if not hasattr(self, "_ten_vad"):
+            self._ten_vad = TenVad(hop_size=hop_size, threshold=threshold)
+        vad = self._ten_vad
+
+        audio_int16 = (waveform * 32767).clip(-32768, 32767).astype(np.int16)
+        n_frames = len(audio_int16) // hop_size
+        flags = np.zeros(n_frames, dtype=np.int32)
+        for i in range(n_frames):
+            frame = audio_int16[i * hop_size : (i + 1) * hop_size]
+            _, flag = vad.process(frame)
+            flags[i] = flag
+
+        frame_dur = hop_size / sr
+        runs = []
+        in_speech = False
+        seg_start = 0
+        for idx, f in enumerate(flags):
+            if f == 1 and not in_speech:
+                seg_start = idx
+                in_speech = True
+            elif f == 0 and in_speech:
+                runs.append((seg_start * frame_dur, idx * frame_dur))
+                in_speech = False
+        if in_speech:
+            runs.append((seg_start * frame_dur, n_frames * frame_dur))
+
+        min_dur_s = min_speech_duration_ms / 1000
+        runs = [r for r in runs if r[1] - r[0] >= min_dur_s]
+        if not runs:
+            return [waveform], [{"sample_idx": 0, "chunk_idx": 0,
+                                  "start": 0.0, "end": waveform.shape[0] / sr}]
+
+        merged = [list(runs[0])]
+        for s, e in runs[1:]:
+            prev_s, prev_e = merged[-1]
+            gap = s - prev_e
+            merged_dur = e - prev_s
+            if gap <= merge_gap_s and merged_dur <= max_chunk_s:
+                merged[-1][1] = e
+            else:
+                merged.append([s, e])
+
+        segment_waveforms = []
+        segment_meta = []
+        for chunk_idx, (s, e) in enumerate(merged):
+            start_idx = int(s * sr)
+            end_idx = int(e * sr)
+            segment_waveforms.append(waveform[start_idx:end_idx].copy())
+            segment_meta.append({
+                "sample_idx": 0, "chunk_idx": chunk_idx,
+                "start": s, "end": e,
+            })
+        return segment_waveforms, segment_meta
+
     def _prepare_segments_silero_coreml(
         self,
         waveform: np.ndarray,
@@ -1312,7 +1388,13 @@ class Model(nn.Module):
         self._validate_language(language)
         waveform = self._to_mono(audio, sample_rate=sample_rate)
         vad_backend = "silero-coreml" if vad is True else (vad if isinstance(vad, str) else None)
-        if vad_backend == "silero-coreml":
+        if vad_backend == "ten":
+            segment_waveforms, segment_meta = self._prepare_segments_ten_vad(
+                waveform,
+                merge_gap_s=vad_merge_gap_s,
+                max_chunk_s=vad_max_chunk_s,
+            )
+        elif vad_backend == "silero-coreml":
             segment_waveforms, segment_meta = self._prepare_segments_silero_coreml(
                 waveform,
                 merge_gap_s=vad_merge_gap_s,
