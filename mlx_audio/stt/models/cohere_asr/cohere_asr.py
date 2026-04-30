@@ -961,6 +961,136 @@ class Model(nn.Module):
 
         return segment_waveforms, segment_meta
 
+    def _prepare_segments_silero(
+        self,
+        waveform: np.ndarray,
+        *,
+        merge_gap_s: float = 0.7,
+        max_chunk_s: float = 30.0,
+    ) -> Tuple[List[np.ndarray], List[Dict[str, Union[int, float, None]]]]:
+        try:
+            import torch
+            from silero_vad import load_silero_vad, get_speech_timestamps
+        except ImportError as exc:
+            raise ImportError(
+                "vad='silero' requires silero-vad. Install with: pip install silero-vad"
+            ) from exc
+
+        sr = self.sample_rate
+        if sr != 16000:
+            raise ValueError(f"silero VAD requires 16kHz, got {sr}")
+
+        if not hasattr(self, "_silero_model"):
+            self._silero_model = load_silero_vad()
+
+        audio_t = torch.from_numpy(waveform.astype(np.float32))
+        ts = get_speech_timestamps(
+            audio_t, self._silero_model,
+            sampling_rate=sr, return_seconds=True,
+        )
+        if not ts:
+            return [waveform], [{"sample_idx": 0, "chunk_idx": 0,
+                                  "start": 0.0, "end": waveform.shape[0] / sr}]
+
+        merged = [[ts[0]["start"], ts[0]["end"]]]
+        for t in ts[1:]:
+            s, e = t["start"], t["end"]
+            prev_s, prev_e = merged[-1]
+            gap = s - prev_e
+            merged_dur = e - prev_s
+            if gap <= merge_gap_s and merged_dur <= max_chunk_s:
+                merged[-1][1] = e
+            else:
+                merged.append([s, e])
+
+        segment_waveforms = []
+        segment_meta = []
+        for chunk_idx, (s, e) in enumerate(merged):
+            start_idx = int(s * sr)
+            end_idx = int(e * sr)
+            segment_waveforms.append(waveform[start_idx:end_idx].copy())
+            segment_meta.append({
+                "sample_idx": 0, "chunk_idx": chunk_idx,
+                "start": s, "end": e,
+            })
+        return segment_waveforms, segment_meta
+
+    def _prepare_segments_vad(
+        self,
+        waveform: np.ndarray,
+        *,
+        aggressiveness: int = 3,
+        merge_gap_s: float = 1.0,
+        max_chunk_s: float = 30.0,
+        frame_ms: int = 30,
+        padding_ms: int = 300,
+        min_speech_ms: int = 200,
+    ) -> Tuple[List[np.ndarray], List[Dict[str, Union[int, float, None]]]]:
+        try:
+            import webrtcvad
+        except ImportError as exc:
+            raise ImportError(
+                "vad=True requires webrtcvad. Install with: pip install webrtcvad"
+            ) from exc
+
+        sr = self.sample_rate
+        if sr not in (8000, 16000, 32000, 48000):
+            raise ValueError(f"webrtcvad requires sr in 8/16/32/48kHz, got {sr}")
+        audio_int16 = (waveform * 32767).clip(-32768, 32767).astype(np.int16)
+        vad = webrtcvad.Vad(aggressiveness)
+        frame_samples = int(sr * frame_ms / 1000)
+        pad_frames = padding_ms // frame_ms
+        min_speech_frames = min_speech_ms // frame_ms
+
+        speech_runs = []
+        cur_start = None
+        speech_run = 0
+        silent_run = 0
+        for i in range(0, len(audio_int16) - frame_samples + 1, frame_samples):
+            f = audio_int16[i : i + frame_samples]
+            is_speech = vad.is_speech(f.tobytes(), sr)
+            if is_speech:
+                if cur_start is None:
+                    cur_start = max(0, i - pad_frames * frame_samples)
+                speech_run += 1
+                silent_run = 0
+            else:
+                if cur_start is not None:
+                    silent_run += 1
+                    if silent_run > pad_frames:
+                        if speech_run >= min_speech_frames:
+                            speech_runs.append((cur_start, i + frame_samples))
+                        cur_start = None
+                        speech_run = 0
+                        silent_run = 0
+        if cur_start is not None and speech_run >= min_speech_frames:
+            speech_runs.append((cur_start, len(audio_int16)))
+
+        speech_runs = [r for r in speech_runs if (r[1] - r[0]) / sr >= 0.3]
+        if not speech_runs:
+            return [waveform], [{"sample_idx": 0, "chunk_idx": 0,
+                                  "start": 0.0, "end": waveform.shape[0] / sr}]
+
+        merged = [list(speech_runs[0])]
+        for s, e in speech_runs[1:]:
+            prev_s, prev_e = merged[-1]
+            gap = (s - prev_e) / sr
+            merged_dur = (e - prev_s) / sr
+            if gap <= merge_gap_s and merged_dur <= max_chunk_s:
+                merged[-1][1] = e
+            else:
+                merged.append([s, e])
+
+        segment_waveforms = []
+        segment_meta = []
+        for chunk_idx, (s, e) in enumerate(merged):
+            segment_waveforms.append(waveform[s:e].copy())
+            segment_meta.append({
+                "sample_idx": 0, "chunk_idx": chunk_idx,
+                "start": s / sr, "end": e / sr,
+            })
+        return segment_waveforms, segment_meta
+
     def transcribe(
         self,
         *,
@@ -1034,6 +1164,10 @@ class Model(nn.Module):
         verbose: bool = False,
         stream: bool = False,
         sample_rate: Optional[int] = None,
+        vad: Union[bool, str] = False,
+        vad_aggressiveness: int = 3,
+        vad_merge_gap_s: float = 1.0,
+        vad_max_chunk_s: float = 30.0,
         **kwargs,
     ) -> STTOutput:
         if stream:
@@ -1044,7 +1178,22 @@ class Model(nn.Module):
         start_time = time.time()
         self._validate_language(language)
         waveform = self._to_mono(audio, sample_rate=sample_rate)
-        segment_waveforms, segment_meta = self._prepare_segments([waveform])
+        vad_backend = "webrtc" if vad is True else (vad if isinstance(vad, str) else None)
+        if vad_backend == "silero":
+            segment_waveforms, segment_meta = self._prepare_segments_silero(
+                waveform,
+                merge_gap_s=vad_merge_gap_s,
+                max_chunk_s=vad_max_chunk_s,
+            )
+        elif vad_backend == "webrtc":
+            segment_waveforms, segment_meta = self._prepare_segments_vad(
+                waveform,
+                aggressiveness=vad_aggressiveness,
+                merge_gap_s=vad_merge_gap_s,
+                max_chunk_s=vad_max_chunk_s,
+            )
+        else:
+            segment_waveforms, segment_meta = self._prepare_segments([waveform])
         texts, generation_counts, prompt_len = self._transcribe_waveforms_batched(
             segment_waveforms,
             language=language,
