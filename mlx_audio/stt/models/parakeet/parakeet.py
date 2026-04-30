@@ -559,12 +559,22 @@ class ParakeetTDT(Model):
         batch_features, lengths = self.encoder(mel)
         mx.eval(batch_features, lengths)
 
+        time_mult = (
+            self.encoder_config.subsampling_factor
+            / self.preprocessor_config.sample_rate
+            * self.preprocessor_config.hop_length
+        )
+        blank_id = self.blank_id
+        durations = self.durations
+        vocabulary = self.vocabulary
+        max_symbols = self.max_symbols
+
         results = []
         for b in range(batch_size):
             features = batch_features[b : b + 1]
             max_length = int(lengths[b])
 
-            last_token = self.blank_id
+            last_token = blank_id
             hypothesis = []
 
             time = 0
@@ -582,24 +592,18 @@ class ParakeetTDT(Model):
 
                 pred_token_i = int(pred_token)
                 decision_i = int(decision)
-                duration_i = self.durations[decision_i]
+                duration_i = durations[decision_i]
 
-                if pred_token_i != self.blank_id:
+                if pred_token_i != blank_id:
                     last_token = pred_token_i
                     decoder_hidden = (hidden, cell)
-                    if not tokenizer.is_special_token(last_token, self.vocabulary):
+                    if not tokenizer.is_special_token(last_token, vocabulary):
                         hypothesis.append(
                             AlignedToken(
                                 last_token,
-                                start=time
-                                * self.encoder_config.subsampling_factor
-                                / self.preprocessor_config.sample_rate
-                                * self.preprocessor_config.hop_length,
-                                duration=duration_i
-                                * self.encoder_config.subsampling_factor
-                                / self.preprocessor_config.sample_rate
-                                * self.preprocessor_config.hop_length,
-                                text=tokenizer.decode([last_token], self.vocabulary),
+                                start=time * time_mult,
+                                duration=duration_i * time_mult,
+                                text=tokenizer.decode([last_token], vocabulary),
                             )
                         )
 
@@ -608,10 +612,9 @@ class ParakeetTDT(Model):
 
                 if duration_i != 0:
                     new_symbols = 0
-                else:
-                    if self.max_symbols is not None and self.max_symbols <= new_symbols:
-                        time += 1
-                        new_symbols = 0
+                elif max_symbols is not None and max_symbols <= new_symbols:
+                    time += 1
+                    new_symbols = 0
 
             result = sentences_to_result(tokens_to_sentences(hypothesis))
             results.append(result)

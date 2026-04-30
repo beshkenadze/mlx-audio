@@ -791,53 +791,54 @@ class Model(nn.Module):
         encoder_hidden_states, _, encoder_mask = self._encode_waveforms(waveforms)
         batch_size = len(waveforms)
         prompt_ids = mx.array([prompt_tokens] * batch_size, dtype=mx.int32)
-        logits, cache = self.transf_decoder(
+        hidden, cache = self.transf_decoder(
             prompt_ids,
             encoder_hidden_states,
             encoder_mask=encoder_mask,
             cache=None,
             start_pos=0,
         )
-        logits = self.log_softmax(logits)
+        lm_head = self.log_softmax.mlp.layer0
+        logits = lm_head(hidden[:, -1:, :])
 
         if max_tokens <= 0:
             return [[] for _ in range(batch_size)], len(prompt_tokens)
 
-        next_tokens = mx.argmax(logits[:, -1, :], axis=-1)
-        next_tokens_np = np.array(next_tokens)
         eos_id = self._tokenizer.eos_token_id
-        finished = next_tokens_np == eos_id
-        generated = [[] for _ in range(batch_size)]
-
-        for idx, token_id in enumerate(next_tokens_np.tolist()):
-            if token_id != eos_id:
-                generated[idx].append(int(token_id))
-
+        eos_mx = mx.array(eos_id, dtype=mx.int32)
         prompt_len = len(prompt_tokens)
-        current_tokens = next_tokens_np.astype(np.int32)
 
+        current_tokens = mx.argmax(logits[:, -1, :], axis=-1).astype(mx.int32)
+        finished = current_tokens == eos_mx
+        token_steps: List[mx.array] = [current_tokens]
+
+        sync_interval = 16
         for step in range(max_tokens - 1):
-            if bool(np.all(finished)):
+            if (step + 1) % sync_interval == 0 and bool(mx.all(finished)):
                 break
 
-            feed_tokens = current_tokens.copy()
-            feed_tokens[finished] = eos_id
-            logits, cache = self.transf_decoder(
-                mx.array(feed_tokens[:, None], dtype=mx.int32),
+            feed_tokens = mx.where(finished, eos_mx, current_tokens)
+            hidden, cache = self.transf_decoder(
+                feed_tokens[:, None],
                 encoder_hidden_states,
                 encoder_mask=encoder_mask,
                 cache=cache,
                 start_pos=prompt_len + step,
             )
-            logits = self.log_softmax(logits)
-            current_tokens = np.array(mx.argmax(logits[:, -1, :], axis=-1)).astype(
-                np.int32
-            )
+            logits = lm_head(hidden)
+            current_tokens = mx.argmax(logits[:, -1, :], axis=-1).astype(mx.int32)
+            token_steps.append(current_tokens)
+            finished = finished | (current_tokens == eos_mx)
 
-            for idx, token_id in enumerate(current_tokens.tolist()):
-                if not finished[idx] and token_id != eos_id:
-                    generated[idx].append(int(token_id))
-            finished = finished | (current_tokens == eos_id)
+        all_tokens_np = np.asarray(mx.stack(token_steps, axis=1))
+
+        generated: List[List[int]] = [[] for _ in range(batch_size)]
+        for b in range(batch_size):
+            for token_id in all_tokens_np[b].tolist():
+                tid = int(token_id)
+                if tid == eos_id:
+                    break
+                generated[b].append(tid)
 
         return generated, prompt_len
 
