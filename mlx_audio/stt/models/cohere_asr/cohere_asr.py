@@ -6,6 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten
+from mlx_lm.models.cache import KVCache
 
 from mlx_audio.stt.models.base import STTOutput
 
@@ -348,19 +349,30 @@ class DecoderAttention(nn.Module):
         hidden_states: mx.array,
         context_states: Optional[mx.array] = None,
         attention_mask: Optional[mx.array] = None,
-        cache: Optional[Tuple[mx.array, mx.array]] = None,
-    ) -> Tuple[mx.array, Tuple[mx.array, mx.array]]:
+        cache=None,
+    ):
         query = self._reshape(self.query_net(hidden_states))
-        source = hidden_states if context_states is None else context_states
 
-        if cache is not None and context_states is not None:
-            key, value = cache
+        if context_states is None:
+            key = self._reshape(self.key_net(hidden_states))
+            value = self._reshape(self.value_net(hidden_states))
+            if isinstance(cache, KVCache):
+                key, value = cache.update_and_fetch(key, value)
+                new_cache = cache
+            else:
+                new_cache = (key, value)
         else:
-            key = self._reshape(self.key_net(source))
-            value = self._reshape(self.value_net(source))
-            if cache is not None and context_states is None:
-                key = mx.concatenate([cache[0], key], axis=2)
-                value = mx.concatenate([cache[1], value], axis=2)
+            if (
+                isinstance(cache, tuple)
+                and cache[0] is not None
+                and cache[1] is not None
+            ):
+                key, value = cache
+                new_cache = cache
+            else:
+                key = self._reshape(self.key_net(context_states))
+                value = self._reshape(self.value_net(context_states))
+                new_cache = (key, value)
 
         output = mx.fast.scaled_dot_product_attention(
             query,
@@ -372,7 +384,7 @@ class DecoderAttention(nn.Module):
         output = output.transpose(0, 2, 1, 3).reshape(
             hidden_states.shape[0], hidden_states.shape[1], self.hidden_size
         )
-        return self.out_projection(output), (key, value)
+        return self.out_projection(output), new_cache
 
 
 class DecoderFeedForward(nn.Module):
@@ -517,9 +529,9 @@ class TransformerDecoderWrapper(nn.Module):
         input_ids: mx.array,
         encoder_hidden_states: mx.array,
         encoder_mask: Optional[mx.array] = None,
-        cache: Optional[List[Dict[str, Tuple[mx.array, mx.array]]]] = None,
+        cache=None,
         start_pos: int = 0,
-    ) -> Tuple[mx.array, List[Dict[str, Tuple[mx.array, mx.array]]]]:
+    ):
         batch, seq_len = input_ids.shape
         positions = mx.arange(start_pos, start_pos + seq_len, dtype=mx.int32)
         positions = mx.broadcast_to(positions[None, :], (batch, seq_len))
@@ -530,12 +542,17 @@ class TransformerDecoderWrapper(nn.Module):
             self_attention_mask = nn.MultiHeadAttention.create_additive_causal_mask(
                 seq_len
             ).astype(hidden_states.dtype)
-            if (
-                cache is not None
-                and cache[0] is not None
-                and cache[0]["self_attn"] is not None
-            ):
-                cached_len = cache[0]["self_attn"][0].shape[2]
+            cached_len = 0
+            if cache is not None and cache[0] is not None:
+                self_attn_cache = cache[0]["self_attn"]
+                if isinstance(self_attn_cache, KVCache):
+                    cached_len = self_attn_cache.offset
+                elif (
+                    isinstance(self_attn_cache, tuple)
+                    and self_attn_cache[0] is not None
+                ):
+                    cached_len = self_attn_cache[0].shape[2]
+            if cached_len > 0:
                 prefix = mx.zeros((seq_len, cached_len), dtype=hidden_states.dtype)
                 self_attention_mask = mx.concatenate(
                     [prefix, self_attention_mask], axis=1
@@ -662,6 +679,13 @@ class Model(nn.Module):
         )
         self.audio_frontend = CohereAudioFrontend(config.preprocessor)
         self._tokenizer: Optional[CohereAsrTokenizer] = None
+
+    def make_cache(self):
+        n_layers = len(self.transf_decoder.decoder.layers)
+        return [
+            {"self_attn": KVCache(), "cross_attn": (None, None)}
+            for _ in range(n_layers)
+        ]
 
     @property
     def sample_rate(self) -> int:
@@ -791,11 +815,12 @@ class Model(nn.Module):
         encoder_hidden_states, _, encoder_mask = self._encode_waveforms(waveforms)
         batch_size = len(waveforms)
         prompt_ids = mx.array([prompt_tokens] * batch_size, dtype=mx.int32)
+        cache = self.make_cache()
         hidden, cache = self.transf_decoder(
             prompt_ids,
             encoder_hidden_states,
             encoder_mask=encoder_mask,
-            cache=None,
+            cache=cache,
             start_pos=0,
         )
         lm_head = self.log_softmax.mlp.layer0
