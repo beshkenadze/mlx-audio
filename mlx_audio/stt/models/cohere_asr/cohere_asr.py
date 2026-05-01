@@ -13,6 +13,8 @@ from .audio import CohereAudioFrontend
 from .config import DecoderInnerConfig, EncoderConfig, ModelConfig
 from .tokenizer import CohereAsrTokenizer
 
+# ci-narrow-test: stt-only diff to verify path-filter narrows matrix to ["stt"]
+
 NO_SPACE_LANGS = {"ja", "zh"}
 
 
