@@ -483,6 +483,75 @@ class Model(nn.Module):
             return codes_out, eos_frame
         return codes_out
 
+    def teacher_forced_logits(
+        self,
+        input_ids: mx.array,
+        forced_tokens: mx.array,
+    ) -> mx.array:
+        """Record per-step pre-sampling logits under teacher forcing.
+
+        Runs the same prefill + single-token decode path as
+        :meth:`generate_codes`, but at every step the next input row is built
+        from the supplied reference ``forced_tokens`` rather than from the
+        model's own argmax. This pins the decode context to exactly what the
+        reference (CUDA) run saw, so the recorded logits are directly comparable
+        position-by-position.
+
+        Args:
+            input_ids: prompt of shape ``[seq, frame_width]`` (or
+                ``[1, seq, frame_width]``) of int ids.
+            forced_tokens: reference audio codes ``[n_frames, n_codebooks]``.
+                Step ``t`` reads the prediction conditioned on the prompt plus
+                ``forced_tokens[:t]``; ``forced_tokens[t]`` is then appended as
+                the next input row (text column = ``text_pad_id``).
+
+        Returns:
+            ``[n_frames, n_codebooks, audio_vocab]`` float32 pre-sampling,
+            post-softcap logits (one slice per decode step).
+        """
+        if input_ids.ndim == 2:
+            input_ids = input_ids[None]
+        input_ids = input_ids.astype(mx.int32)
+        forced_tokens = forced_tokens.astype(mx.int32)
+        n_frames = int(forced_tokens.shape[0])
+        if n_frames == 0:
+            return mx.zeros(
+                (0, self.n_codebooks, self.config.audio_vocab), dtype=mx.float32
+            )
+
+        cache = self.backbone.make_cache()
+
+        # Prefill all but the last prompt row as a block, then feed the last row
+        # as a single-token step (same exact-decode path as generate_codes; see
+        # the note there about the Metal SDPA final-query corruption).
+        if input_ids.shape[1] > 1:
+            self.backbone(input_ids[:, :-1, :], cache=cache)
+        hidden = self.backbone(input_ids[:, -1:, :], cache=cache)
+        last_hidden = hidden[:, -1:, :]
+
+        logits_per_step: List[mx.array] = []
+        for step in range(n_frames):
+            logits = self.backbone.compute_logits(last_hidden)  # [1, 1, C, V]
+            step_logits = logits[0, 0]  # [C, V]
+            logits_per_step.append(step_logits)
+
+            if step == n_frames - 1:
+                # The final step's logits are already recorded; the forced row
+                # after it would only feed a position whose prediction is never
+                # read, so skip that dead forward pass.
+                mx.eval(step_logits)
+                break
+
+            # Force the next-row context from the reference tokens.
+            row = self._next_input_row(forced_tokens[step])
+            hidden = self.backbone(row, cache=cache)
+            last_hidden = hidden[:, -1:, :]
+            # Materialize per step so the compute graph and memory stay bounded
+            # over the full decode loop (mirrors generate_codes).
+            mx.eval(last_hidden, step_logits)
+
+        return mx.stack(logits_per_step, axis=0)  # [n_frames, C, V]
+
     @staticmethod
     def shear_up(codes: mx.array, pad_id: int) -> mx.array:
         """Remove the delay pattern: column ``j`` shifted up by ``j`` rows.
