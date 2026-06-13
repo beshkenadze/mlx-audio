@@ -482,6 +482,224 @@ def test_speaker_injection_out_of_range_position_raises():
     assert raised, "out-of-range speaker_pos must raise, not silently no-op"
 
 
+def _quality_config(**ov) -> ZONOS2Config:
+    """Tiny config with speaking-rate + 2 quality features + bg/acc markers.
+
+    Mirrors the real conditioning-token tail layout so the prompt-builder token
+    math can be checked against hand-derived ids.
+    """
+    return _tiny_config(
+        text_vocab=40,
+        speaker_background_token_enabled=True,
+        accurate_mode_token_enabled=True,
+        speaking_rate_num_buckets=2,
+        quality_features=("lufs", "snr"),
+        quality_buckets={"lufs": ("a", "b", "c"), "snr": ("d", "e")},
+        **ov,
+    )
+
+
+def test_conditioning_base_and_token_ids():
+    """base/clean-bg/rate/quality ids match the upstream tail arithmetic."""
+    cfg = _quality_config()
+    model = Model(cfg)
+    rate, bg, acc = 2, 2, 1
+    counts = [3, 2]  # lufs, snr
+    base = cfg.text_vocab - rate - sum(counts) - bg - acc
+    assert model._conditioning_base_text_vocab() == base
+    # clean-bg marker = text_vocab - bg - acc (first of the trailing markers).
+    assert model._clean_background_token() == cfg.text_vocab - bg - acc
+    # speaking-rate bucket b -> base + b.
+    assert model._speaking_rate_token(0) == base
+    assert model._speaking_rate_token(1) == base + 1
+    # quality: base + rate + sum(counts[:feature]) + bucket.
+    assert model._quality_token(0, 0) == base + rate + 0  # lufs[0]
+    assert model._quality_token(0, 2) == base + rate + 2  # lufs[2]
+    assert model._quality_token(1, 0) == base + rate + 3  # snr[0] (after 3 lufs)
+    assert model._quality_token(1, 1) == base + rate + 4  # snr[1]
+
+
+def test_resolve_quality_buckets_dict_list_and_default():
+    cfg = _quality_config()
+    model = Model(cfg)
+    # dict -> feature order; missing feature -> None.
+    assert model._resolve_quality_buckets({"snr": 1}) == [None, 1]
+    assert model._resolve_quality_buckets({"lufs": 2, "snr": 0}) == [2, 0]
+    # list -> truncated to feature count.
+    assert model._resolve_quality_buckets([1, 0, 9]) == [1, 0]
+    # None -> the default conditioning (trailing_silence_s only -> all None here,
+    # since this tiny config has no trailing_silence_s feature).
+    assert model._resolve_quality_buckets(None) == [None, None]
+    # empty dict -> disable (all None).
+    assert model._resolve_quality_buckets({}) == [None, None]
+    # model without quality conditioning -> None regardless.
+    plain = Model(_tiny_config())
+    assert plain._resolve_quality_buckets({"x": 1}) is None
+
+
+def test_shear_down_applies_delay_pattern():
+    # Independent ground truth (not via shear_up): column j shifted DOWN by j rows;
+    # vacated head filled with pad. Mirrors upstream ``shear``.
+    pad = 99
+    codes = mx.array(
+        [
+            [10, 11, 12],
+            [20, 21, 22],
+            [30, 31, 32],
+        ],
+        dtype=mx.int32,
+    )
+    out = np.asarray(Model._shear_down(codes, pad))
+    expected = np.array(
+        [
+            [10, pad, pad],
+            [20, 11, pad],
+            [30, 21, 12],
+        ],
+        dtype=np.int64,
+    )
+    assert np.array_equal(out, expected)
+
+
+def test_shear_down_is_inverse_of_shear_up():
+    pad = 99
+    base = mx.array(np.random.randint(0, 50, (7, 9)).astype(np.int32))
+    down = Model._shear_down(base, pad)
+    up = Model.shear_up(down, pad)
+    # shear_up(shear_down(x)) == x for every cell that was not pushed out the tail.
+    n = np.asarray(base)
+    r = np.asarray(up)
+    for t in range(n.shape[0]):
+        for c in range(n.shape[1]):
+            if t + c < n.shape[0]:  # cell survives the round trip
+                assert int(r[t, c]) == int(n[t, c])
+
+
+def test_build_prompt_ids_row_structure():
+    cfg = _quality_config()
+    model = Model(cfg)
+    text = "hi"
+    # No silence, explicit quality + speaking rate so every row is deterministic.
+    prompt = model.build_prompt_ids(
+        text,
+        quality_buckets={"lufs": 1, "snr": 0},
+        speaking_rate_bucket=1,
+        normalize=False,
+        prepend_silence=False,
+    )
+    np_p = np.asarray(prompt)
+    pad = cfg.audio_pad_id
+    # All audio columns are the audio pad id (text-only prompt rows).
+    assert np.all(np_p[:, : cfg.n_codebooks] == pad)
+    text_col = np_p[:, cfg.n_codebooks].tolist()
+    enc = model.tokenizer.encode(text)  # BOS + bytes + EOS
+    expected = [
+        model._speaking_rate_token(1),
+        model._quality_token(0, 1),
+        model._quality_token(1, 0),
+        *enc,
+    ]
+    assert text_col == expected
+    assert np_p.shape == (len(expected), cfg.n_codebooks + 1)
+
+
+def _reference_silence_suffix(cfg: ZONOS2Config) -> np.ndarray:
+    """Independent ground truth for ``_silence_suffix`` (no shear helper reuse).
+
+    Down-shears the verbatim ``_SILENCE_TOKENS_0_2S`` constant by hand
+    (``out[t, c] = silence[t - c, c]`` for ``t >= c`` else ``audio_pad_id``) and
+    appends the text-pad column, mirroring upstream ``silence_prompt_tokens``.
+    """
+    from mlx_audio.tts.models.zonos2.zonos2 import _SILENCE_TOKENS_0_2S
+
+    silence = np.array(_SILENCE_TOKENS_0_2S, dtype=np.int64)[:, : cfg.n_codebooks]
+    rows, cols = silence.shape
+    out = np.full((rows, cols), cfg.audio_pad_id, dtype=np.int64)
+    for t in range(rows):
+        for c in range(cols):
+            if t - c >= 0:
+                out[t, c] = silence[t - c, c]
+    text_col = np.full((rows, 1), cfg.text_vocab, dtype=np.int64)
+    return np.concatenate([out, text_col], axis=1)
+
+
+def test_build_prompt_ids_appends_silence_suffix():
+    cfg = _quality_config()
+    model = Model(cfg)
+    with_sil = np.asarray(
+        model.build_prompt_ids("hi", quality_buckets={}, normalize=False)
+    )
+    without = np.asarray(
+        model.build_prompt_ids(
+            "hi", quality_buckets={}, normalize=False, prepend_silence=False
+        )
+    )
+    # 17 silence frames appended (the trained 0.2 s prefix).
+    assert with_sil.shape[0] == without.shape[0] + 17
+    suffix = np.asarray(model._silence_suffix()).astype(np.int64)
+    assert suffix.shape == (17, cfg.n_codebooks + 1)
+    # Silence suffix text column is the text-pad id everywhere.
+    assert np.all(suffix[:, cfg.n_codebooks] == cfg.text_vocab)
+    # Verify the SHEARED VALUES against an independent hand-computed reference
+    # (not against _silence_suffix itself) so a wrong shear direction is caught.
+    assert np.array_equal(suffix, _reference_silence_suffix(cfg))
+    assert np.array_equal(with_sil[-17:], suffix)
+
+
+def test_build_prompt_ids_default_quality_only_trailing_silence():
+    """The default conditioning sets only trailing_silence_s (matches upstream)."""
+    cfg = _tiny_config(
+        text_vocab=40,
+        speaker_background_token_enabled=True,
+        accurate_mode_token_enabled=True,
+        speaking_rate_num_buckets=2,
+        quality_features=("lufs", "trailing_silence_s"),
+        quality_buckets={
+            "lufs": ("a", "b"),
+            "trailing_silence_s": ("p", "q", "r", "s"),
+        },
+    )
+    model = Model(cfg)
+    resolved = model._resolve_quality_buckets(None)
+    # DEFAULT_QUALITY_BUCKETS == {"trailing_silence_s": 3}.
+    assert resolved == [None, 3]
+    prompt = np.asarray(
+        model.build_prompt_ids("x", normalize=False, prepend_silence=False)
+    )
+    enc = model.tokenizer.encode("x")
+    # One quality row (trailing_silence_s bucket 3) then the text rows.
+    assert prompt[:, cfg.n_codebooks].tolist() == [model._quality_token(1, 3), *enc]
+
+
+def test_generate_from_text_builds_prompt_and_runs():
+    """``generate(text=...)`` now builds the prompt itself (no NotImplementedError).
+
+    Uses the full ``text_vocab=519`` so the byte rows (``byte + 192`` -> ids up to
+    447) index a real text-embedding table; a tiny ``text_vocab`` would push those
+    ids out of bounds and MLX ``nn.Embedding`` reads garbage instead of raising,
+    making the smoke test pass vacuously.
+    """
+    cfg = _tiny_config(
+        text_vocab=519,
+        speaker_background_token_enabled=True,
+        accurate_mode_token_enabled=True,
+        speaking_rate_num_buckets=2,
+        quality_features=("lufs", "snr"),
+        quality_buckets={"lufs": ("a", "b", "c"), "snr": ("d", "e")},
+    )
+    model = Model(cfg)
+    codes, _ = model.generate(
+        "hello",
+        quality_buckets={},
+        max_frames=3,
+        temperature=0.0,
+        top_k=1,
+        decode_audio=False,
+    )
+    assert codes.shape == (3, cfg.n_codebooks)
+    assert codes.dtype == mx.int32
+
+
 def test_load_weights_reconciles_convert_keys():
     """A synthetic checkpoint in convert.py's key layout loads strictly."""
     cfg = _tiny_config()

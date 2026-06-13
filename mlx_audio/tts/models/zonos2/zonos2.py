@@ -52,6 +52,35 @@ from mlx_audio.tts.models.zonos2.moe import MoEFeedForward
 from mlx_audio.tts.models.zonos2.sampling import make_codebook_sampler
 from mlx_audio.tts.models.zonos2.tokenizer import ZONOS2Tokenizer
 
+# Default quality conditioning applied by the upstream offline TTS / server when
+# no explicit ``quality_buckets`` is given: it only sets a trailing-silence bucket
+# and leaves SNR / loudness / bandwidth unconditioned, which is why the default
+# voice carries background noise. Mirrors ``tts/llm.py DEFAULT_QUALITY_BUCKETS``.
+DEFAULT_QUALITY_BUCKETS = {"trailing_silence_s": 3}
+
+# Pre-computed 0.2 s silence frames (17 frames x 9 codebooks) appended after the
+# text prompt before audio generation begins. Verbatim from upstream
+# ``tts/prompt.py _SILENCE_TOKENS_0_2S`` (the trained prompt format).
+_SILENCE_TOKENS_0_2S = [
+    [568, 778, 338, 524, 967, 360, 728, 550, 90],
+    [568, 778, 10, 674, 364, 981, 741, 378, 731],
+    [568, 804, 10, 674, 364, 981, 568, 378, 731],
+    [568, 804, 10, 674, 364, 981, 568, 378, 731],
+    [568, 804, 10, 674, 364, 981, 568, 378, 731],
+    [568, 804, 10, 674, 364, 981, 568, 378, 731],
+    [568, 804, 10, 674, 364, 981, 568, 378, 731],
+    [568, 804, 10, 674, 364, 981, 568, 378, 731],
+    [568, 804, 10, 674, 364, 981, 568, 378, 731],
+    [568, 804, 10, 674, 364, 981, 568, 378, 731],
+    [568, 804, 10, 674, 364, 981, 568, 378, 731],
+    [568, 804, 10, 674, 364, 981, 568, 378, 731],
+    [568, 804, 10, 674, 364, 981, 568, 378, 731],
+    [568, 804, 10, 674, 364, 981, 568, 378, 731],
+    [568, 804, 10, 674, 364, 981, 568, 378, 731],
+    [568, 804, 10, 674, 364, 981, 568, 378, 731],
+    [568, 778, 721, 842, 264, 974, 989, 507, 308],
+]
+
 
 class RMSNormFused(nn.Module):
     """Fused add-norm RMSNorm mirroring upstream ``RMSNormFused``.
@@ -512,24 +541,194 @@ class Model(nn.Module):
 
     # ── generation ──────────────────────────────────────────────────────────────
 
-    # ── speaker-conditioned prompt assembly ──────────────────────────────────────
+    # ── conditioning / prompt assembly ───────────────────────────────────────────
+
+    def _quality_bucket_counts(self) -> List[int]:
+        """Per-feature quality bucket counts in the model's feature order.
+
+        Mirrors ``self.quality_bucket_counts`` in upstream ``tts/llm.py``: the
+        number of buckets for each feature in ``config.quality_features``, read off
+        the ``config.quality_buckets`` boundary lists. Empty when the model defines
+        no quality conditioning.
+        """
+        cfg = self.config
+        buckets = cfg.quality_buckets or {}
+        return [len(buckets.get(feature, ())) for feature in cfg.quality_features]
+
+    def _conditioning_counts(self) -> Tuple[int, int, int, List[int]]:
+        """Return ``(speaking_rate_num_buckets, bg, acc, quality_counts)``.
+
+        ``bg`` / ``acc`` are the speaker-background (clean+noisy) and accurate-mode
+        marker counts that occupy the very tail of the text vocab (accurate-mode is
+        only present when speaker-background is). Single source of truth for every
+        conditioning-token offset.
+        """
+        cfg = self.config
+        rate = int(cfg.speaking_rate_num_buckets)
+        bg = 2 if cfg.speaker_background_token_enabled else 0
+        acc = 1 if (cfg.accurate_mode_token_enabled and bg > 0) else 0
+        return rate, bg, acc, self._quality_bucket_counts()
+
+    def _conditioning_base_text_vocab(self) -> int:
+        """First conditioning-token id (``base``) in the text vocabulary tail.
+
+        Conditioning tokens occupy the tail of the text vocab in order:
+        speaking-rate, quality (per feature), speaker-background (clean, noisy),
+        accurate-mode. ``base = text_vocab - rate - sum(quality) - bg - acc`` is the
+        id of the first speaking-rate slot; every other conditioning id is an offset
+        from it. Mirrors upstream ``_conditioning_base_text_vocab``.
+        """
+        rate, bg, acc, counts = self._conditioning_counts()
+        return int(self.text_vocab) - rate - sum(counts) - bg - acc
 
     def _clean_background_token(self) -> int:
         """Token id of the clean speaker-background marker.
 
-        Conditioning tokens occupy the tail of the text vocabulary in order:
-        speaking-rate, quality (per feature), speaker-background (clean, noisy),
-        accurate-mode. Upstream ``speaker_background_token_id(clean=True)`` resolves
-        to ``base + rate + sum(quality) + 0`` where ``base = text_vocab - rate -
-        sum(quality) - bg - acc``; the rate and quality terms cancel, so the clean
-        marker is simply the first of the (bg + acc) trailing slots:
-        ``text_vocab - bg - acc``. Computing it this way is independent of how the
-        rate/quality bucket counts happen to be represented on the config.
+        ``speaker_background_token_id(clean=True) = base + rate + sum(quality) + 0``;
+        the rate/quality terms cancel against ``base`` so the clean marker is simply
+        the first of the (bg + acc) trailing slots: ``text_vocab - bg - acc``.
         """
-        cfg = self.config
-        bg = 2 if cfg.speaker_background_token_enabled else 0
-        acc = 1 if (cfg.accurate_mode_token_enabled and bg > 0) else 0
-        return int(cfg.text_vocab) - bg - acc
+        _, bg, acc, _ = self._conditioning_counts()
+        return int(self.text_vocab) - bg - acc
+
+    def _speaking_rate_token(self, bucket: int) -> int:
+        """Token id for speaking-rate ``bucket`` (``base + bucket``)."""
+        rate, _, _, _ = self._conditioning_counts()
+        if rate <= 0:
+            raise ValueError("Model does not define speaking-rate buckets.")
+        if not 0 <= int(bucket) < rate:
+            raise ValueError(
+                f"speaking_rate_bucket must be in [0, {rate - 1}], got {bucket}."
+            )
+        return self._conditioning_base_text_vocab() + int(bucket)
+
+    def _quality_token(self, feature_idx: int, bucket: int) -> int:
+        """Token id for quality ``feature_idx`` at ``bucket``.
+
+        ``base + rate + sum(counts[:feature]) + bucket`` (mirrors upstream
+        ``quality_token_id``); the quality block follows the speaking-rate block.
+        """
+        rate, _, _, counts = self._conditioning_counts()
+        if not counts:
+            raise ValueError("Model does not define quality buckets.")
+        f = int(feature_idx)
+        if not 0 <= f < len(counts):
+            raise ValueError(
+                f"quality feature index must be in [0, {len(counts) - 1}], got {f}."
+            )
+        if not 0 <= int(bucket) < counts[f]:
+            raise ValueError(
+                f"quality bucket for feature {f} must be in "
+                f"[0, {counts[f] - 1}], got {bucket}."
+            )
+        return (
+            self._conditioning_base_text_vocab() + rate + sum(counts[:f]) + int(bucket)
+        )
+
+    def _resolve_quality_buckets(
+        self, quality_buckets
+    ) -> Optional[List[Optional[int]]]:
+        """Map a quality-bucket dict/list onto the model's feature order.
+
+        Mirrors upstream ``TTSLLM._resolve_quality_buckets``:
+
+        * model with no quality conditioning -> ``None``;
+        * ``quality_buckets is None`` -> the default conditioning
+          (:data:`DEFAULT_QUALITY_BUCKETS`, same as the server);
+        * ``dict`` -> ``[buckets.get(feature) for feature in quality_features]``;
+        * ``list`` -> truncated to the number of features.
+
+        Pass an empty dict/list to disable quality tokens entirely.
+        """
+        counts = self._quality_bucket_counts()
+        if not counts or sum(counts) == 0:
+            return None
+        if quality_buckets is None:
+            quality_buckets = DEFAULT_QUALITY_BUCKETS
+        features = self.config.quality_features
+        if isinstance(quality_buckets, dict):
+            return [quality_buckets.get(feature) for feature in features]
+        return list(quality_buckets)[: len(features)]
+
+    def _text_row(self, text_token: int) -> List[int]:
+        """A single text-prompt row: ``[audio_pad × n_codebooks, text_token]``."""
+        return [int(self.audio_pad_id)] * self.n_codebooks + [int(text_token)]
+
+    def _silence_suffix(self) -> mx.array:
+        """The trained 0.2 s silence suffix as ``[17, frame_width]`` int32 ids.
+
+        Applies the delay pattern (down-shear) to :data:`_SILENCE_TOKENS_0_2S` and
+        appends the text-pad column, mirroring upstream ``silence_prompt_tokens``.
+        """
+        silence = mx.array(_SILENCE_TOKENS_0_2S, dtype=mx.int32)[:, : self.n_codebooks]
+        sheared = self._shear_down(silence, int(self.audio_pad_id))
+        text_col = mx.full((sheared.shape[0], 1), int(self.text_vocab), dtype=mx.int32)
+        return mx.concatenate([sheared, text_col], axis=1)
+
+    @staticmethod
+    def _shear_down(codes: mx.array, pad_id: int) -> mx.array:
+        """Apply the delay pattern: column ``j`` shifted DOWN by ``j`` rows.
+
+        Inverse of :meth:`shear_up`. ``codes`` is ``[T, C]``; output ``[T, C]`` with
+        ``out[t, j] = codes[t - j, j]`` for ``t >= j`` and ``pad_id`` otherwise.
+        Mirrors upstream ``tts/prompt.py shear``.
+        """
+        T, C = codes.shape[-2], codes.shape[-1]
+        out = mx.full(codes.shape, pad_id, dtype=codes.dtype)
+        for j in range(C):
+            if T > j:
+                out[..., j:, j] = codes[..., : T - j, j]
+        return out
+
+    def build_prompt_ids(
+        self,
+        text: str,
+        *,
+        quality_buckets=None,
+        speaking_rate_bucket: Optional[int] = None,
+        normalize: bool = True,
+        prepend_silence: bool = True,
+    ) -> mx.array:
+        """Build the ``[seq, frame_width]`` text prompt (MLX text->prompt builder).
+
+        Mirrors upstream ``TTSPromptBuilder.build`` / ``_text_rows``. Row order is:
+
+        1. optional speaking-rate conditioning row,
+        2. one quality conditioning row per resolved (non-``None``) feature,
+        3. the text byte rows (``BOS`` + UTF-8 bytes + ``EOS``),
+        4. (when ``prepend_silence``) the trained 0.2 s silence suffix.
+
+        ``quality_buckets`` accepts a feature-keyed dict, a feature-ordered list, or
+        ``None`` for the default (noisy) conditioning; pass ``{}`` to disable quality
+        tokens. Pass the clean buckets (high SNR / good loudness / full bandwidth /
+        minimal silence) to remove the default background noise.
+
+        ``prepend_silence`` names the upstream ``TTSPromptConfig.prepend_silence`` flag
+        (the silence precedes the *generated* audio); the frames are concatenated
+        after the text rows, exactly like upstream ``build``.
+
+        ``normalize`` runs the (optional) NeMo text normalization before byte-encoding.
+        The byte ids therefore depend on whether ``nemo_text_processing`` is installed:
+        for parity against a captured prompt, the capture and this call must agree on
+        the normalization state (the upstream capture normalizes, so the default here
+        is ``True``).
+        """
+        if normalize:
+            text = self.tokenizer.normalize(text)
+        rows: List[List[int]] = []
+        if speaking_rate_bucket is not None:
+            rows.append(self._text_row(self._speaking_rate_token(speaking_rate_bucket)))
+        resolved = self._resolve_quality_buckets(quality_buckets)
+        if resolved is not None:
+            for feature_idx, bucket in enumerate(resolved):
+                if bucket is None:
+                    continue
+                rows.append(self._text_row(self._quality_token(feature_idx, bucket)))
+        rows.extend(self._text_row(tok) for tok in self.tokenizer.encode(text))
+        prompt = mx.array(rows, dtype=mx.int32)
+        if prepend_silence:
+            prompt = mx.concatenate([prompt, self._silence_suffix()], axis=0)
+        return prompt
 
     def with_speaker_frames(self, prompt_ids: mx.array) -> Tuple[mx.array, int]:
         """Prepend the canonical speaker slot + clean-background marker.
@@ -824,6 +1023,9 @@ class Model(nn.Module):
         trim_leading_silence: bool = False,
         prompt_ids: Optional[mx.array] = None,
         speaker_embedding: Optional[mx.array] = None,
+        quality_buckets=None,
+        speaking_rate_bucket: Optional[int] = None,
+        normalize_text: bool = True,
     ):
         """Generate audio from ``text`` (or a prebuilt ``prompt_ids`` tensor).
 
@@ -831,6 +1033,11 @@ class Model(nn.Module):
         the upstream ``TTSSamplingParams``; pass the model defaults
         (``temperature=1.15, top_k=106, top_p=0.0, min_p=0.18,
         repetition_penalty=1.2``) for the clean, full-quality sampler.
+
+        When ``prompt_ids`` is ``None`` the prompt is built from ``text`` via
+        :meth:`build_prompt_ids` using ``quality_buckets`` (feature-keyed dict /
+        feature-ordered list / ``None`` for the default noisy conditioning; pass the
+        clean buckets to drop the background noise) and ``speaking_rate_bucket``.
 
         When ``speaker_embedding`` (a ``[2048]`` / ``[1, 2048]`` ECAPA x-vector)
         is given, the prompt is wrapped with the canonical speaker slot +
@@ -845,10 +1052,11 @@ class Model(nn.Module):
         Returns ``(audio_codes [H, C], waveform [samples] | None)``.
         """
         if prompt_ids is None:
-            raise NotImplementedError(
-                "Text-to-prompt conditioning (speaker/quality buckets, silence "
-                "prefix) is not yet wired; pass a prebuilt `prompt_ids` "
-                "[seq, frame_width] tensor (see parity_test/zonos2/check_full.py)."
+            prompt_ids = self.build_prompt_ids(
+                text,
+                quality_buckets=quality_buckets,
+                speaking_rate_bucket=speaking_rate_bucket,
+                normalize=normalize_text,
             )
 
         speaker_pos: Optional[int] = None
