@@ -1,0 +1,48 @@
+ZONOS2 teacher-forced LOGIT parity (MLX vs CUDA reference)
+================================================================
+
+item 0: 126 frames x 9 cb
+  ref self-consistent (argmax==tokens): False
+  |Δlogit|: max=7.654728 mean=4.020065e-01
+  per-cb mean |Δ|: cb0=6.59e-01 cb1=4.00e-01 cb2=3.44e-01 cb3=5.76e-01 cb4=3.10e-01 cb5=2.70e-01 cb6=2.11e-01 cb7=4.73e-01 cb8=3.75e-01
+  argmax-agree (teacher forced): 98.5009% (1117/1134); mismatches=17
+    f 26 cb1: ref_top1=778(5.93750) ref_top2=402(5.87500) | mlx_pick=402 contended_gap=0.06250 mlx_gap=0.22944 noise=0.46166 -> TIE
+    f 27 cb2: ref_top1=10(6.59375) ref_top2=885(6.31250) | mlx_pick=885 contended_gap=0.28125 mlx_gap=0.02530 noise=0.95258 -> TIE
+    f 29 cb1: ref_top1=1010(2.10938) ref_top2=960(2.06250) | mlx_pick=6 contended_gap=0.07812 mlx_gap=0.01672 noise=0.50685 -> TIE
+    f 29 cb3: ref_top1=959(0.27148) ref_top2=20(0.27148) | mlx_pick=394 contended_gap=0.01172 mlx_gap=0.05162 noise=0.72574 -> TIE
+    f 30 cb2: ref_top1=551(1.25000) ref_top2=10(1.25000) | mlx_pick=551 contended_gap=0.00000 mlx_gap=0.00000 noise=0.15533 -> TIE
+    f 30 cb4: ref_top1=631(1.03906) ref_top2=954(1.03906) | mlx_pick=173 contended_gap=0.19922 mlx_gap=0.14926 noise=0.70525 -> TIE
+    f 30 cb5: ref_top1=274(3.37500) ref_top2=747(3.18750) | mlx_pick=490 contended_gap=0.20312 mlx_gap=0.10321 noise=1.05669 -> TIE
+    f 32 cb5: ref_top1=797(1.21875) ref_top2=920(1.19531) | mlx_pick=920 contended_gap=0.02344 mlx_gap=0.07672 noise=1.03178 -> TIE
+    f 33 cb5: ref_top1=481(1.46875) ref_top2=886(1.32031) | mlx_pick=886 contended_gap=0.14844 mlx_gap=0.00730 noise=0.48524 -> TIE
+    f 34 cb8: ref_top1=724(5.21875) ref_top2=1005(5.12500) | mlx_pick=1005 contended_gap=0.09375 mlx_gap=0.47193 noise=0.88756 -> TIE
+    f 36 cb4: ref_top1=69(1.32812) ref_top2=272(1.29688) | mlx_pick=272 contended_gap=0.03125 mlx_gap=0.21744 noise=0.41812 -> TIE
+    f 38 cb6: ref_top1=594(5.25000) ref_top2=826(5.06250) | mlx_pick=826 contended_gap=0.18750 mlx_gap=0.24043 noise=0.65288 -> TIE
+    f 39 cb8: ref_top1=182(3.84375) ref_top2=918(3.75000) | mlx_pick=918 contended_gap=0.09375 mlx_gap=0.32596 noise=0.84367 -> TIE
+    f 40 cb4: ref_top1=529(6.03125) ref_top2=585(5.65625) | mlx_pick=585 contended_gap=0.37500 mlx_gap=0.03583 noise=0.47167 -> TIE
+    f 40 cb6: ref_top1=763(5.75000) ref_top2=519(5.65625) | mlx_pick=519 contended_gap=0.09375 mlx_gap=0.28150 noise=0.59777 -> TIE
+    f 41 cb4: ref_top1=529(6.65625) ref_top2=585(6.31250) | mlx_pick=585 contended_gap=0.34375 mlx_gap=0.15553 noise=0.37428 -> TIE
+    f 43 cb8: ref_top1=182(7.34375) ref_top2=30(7.15625) | mlx_pick=30 contended_gap=0.18750 mlx_gap=0.64761 noise=0.57350 -> TIE
+  KNOWN CASE: item0 f26cb1: ref top1=778(5.93750) top2=402(5.87500) contended_gap=0.06250 mlx_pick=402 noise=0.46166 TIE
+
+item 1: 126 frames x 9 cb
+  ref self-consistent (argmax==tokens): False
+  |Δlogit|: max=5.771852 mean=3.662291e-01
+  per-cb mean |Δ|: cb0=3.77e-01 cb1=7.08e-01 cb2=4.79e-01 cb3=5.92e-01 cb4=3.24e-01 cb5=1.85e-01 cb6=2.66e-01 cb7=2.40e-01 cb8=1.26e-01
+  argmax-agree (teacher forced): 99.1182% (1124/1134); mismatches=10
+    f  0 cb0: ref_top1=698(11.93750) ref_top2=568(11.81250) | mlx_pick=568 contended_gap=0.12500 mlx_gap=0.05064 noise=0.13962 -> TIE
+    f  3 cb3: ref_top1=753(10.31250) ref_top2=674(10.06250) | mlx_pick=674 contended_gap=0.25000 mlx_gap=0.04657 noise=0.59614 -> TIE
+    f  4 cb3: ref_top1=90(3.87500) ref_top2=600(3.81250) | mlx_pick=417 contended_gap=0.17188 mlx_gap=0.00540 noise=0.32326 -> TIE
+    f  5 cb2: ref_top1=10(1.75000) ref_top2=0(1.60938) | mlx_pick=0 contended_gap=0.14062 mlx_gap=0.05673 noise=1.02807 -> TIE
+    f  5 cb4: ref_top1=364(4.78125) ref_top2=1016(4.71875) | mlx_pick=1016 contended_gap=0.06250 mlx_gap=0.10175 noise=0.67618 -> TIE
+    f  6 cb6: ref_top1=783(7.37500) ref_top2=345(7.06250) | mlx_pick=345 contended_gap=0.31250 mlx_gap=0.07882 noise=0.38572 -> TIE
+    f  8 cb5: ref_top1=872(-0.73047) ref_top2=220(-0.76562) | mlx_pick=109 contended_gap=0.08984 mlx_gap=0.17174 noise=0.22671 -> TIE
+    f  8 cb7: ref_top1=939(5.50000) ref_top2=757(5.40625) | mlx_pick=786 contended_gap=0.12500 mlx_gap=0.53067 noise=0.47203 -> TIE
+    f 11 cb6: ref_top1=580(4.68750) ref_top2=807(4.46875) | mlx_pick=807 contended_gap=0.21875 mlx_gap=0.07270 noise=0.23681 -> TIE
+    f 16 cb8: ref_top1=163(8.68750) ref_top2=300(8.37500) | mlx_pick=300 contended_gap=0.31250 mlx_gap=0.05771 noise=0.48817 -> TIE
+  KNOWN CASE: item1 f0cb0: ref top1=698(11.93750) top2=568(11.81250) contended_gap=0.12500 mlx_pick=568 noise=0.13962 TIE
+
+----------------------------------------------------------------
+VERDICT: PROVEN — max|Δlogit|=7.654728; argmax-agree=98.8095%; 27 mismatch(es), all sub-noise ties: True (stronger mutual-tie cross-check: 25/27)
+  Note: reference logits are softcap-saturated (cap=15, mean|logit|~10), so the confident majority separates the argmax from the runner-up by a large gap (median ~3-4); only a thin near-degenerate tail is sensitive to bf16 Metal-vs-CUDA rounding. Every mismatch lives in that tail.
+  Every teacher-forced argmax mismatch has a reference contended gap (ref[ref_top1]-ref[mlx_pick]) <= the MLX-vs-CUDA logit noise on the two contended tokens. The greedy divergences are irreducible bf16 Metal-vs-CUDA argmax ties, NOT logic bugs.

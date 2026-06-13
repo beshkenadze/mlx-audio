@@ -208,6 +208,72 @@ def test_generate_codes_returns_eos_frame_when_requested():
     assert eos_frame is None or isinstance(eos_frame, int)
 
 
+def test_teacher_forced_logits_shape():
+    cfg = _tiny_config()
+    model = Model(cfg)
+    prompt = _random_prompt(cfg, seq=5)
+    forced = mx.array(
+        np.random.randint(0, cfg.audio_vocab, (4, cfg.n_codebooks)).astype(np.int32)
+    )
+    logits = model.teacher_forced_logits(prompt, forced)
+    assert logits.shape == (4, cfg.n_codebooks, cfg.audio_vocab)
+    assert logits.dtype == mx.float32
+
+
+def test_teacher_forced_logits_match_forced_replay():
+    """Teacher-forced step-t logits == a manual forced KV-cache replay.
+
+    Feeding ``forced_tokens`` step by step through the backbone (prompt last row,
+    then each forced row) must reproduce exactly the per-step logits the method
+    records, confirming the decode context is pinned to the forced tokens.
+    """
+    cfg = _tiny_config()
+    model = Model(cfg)
+    prompt = _random_prompt(cfg, seq=6)
+    n = 4
+    forced_np = np.random.randint(0, cfg.audio_vocab, (n, cfg.n_codebooks)).astype(
+        np.int32
+    )
+    forced = mx.array(forced_np)
+
+    tf_logits = np.asarray(model.teacher_forced_logits(prompt, forced))
+
+    # Manual replay: same prefill, then read logits BEFORE appending each forced
+    # row (so step t is conditioned on prompt + forced[:t]).
+    cache = model.backbone.make_cache()
+    pids = prompt[None].astype(mx.int32)
+    model.backbone(pids[:, :-1, :], cache=cache)
+    hidden = model.backbone(pids[:, -1:, :], cache=cache)
+    manual = []
+    for t in range(n):
+        logits = model.backbone.compute_logits(hidden[:, -1:, :])
+        manual.append(np.asarray(logits[0, 0]))
+        row = model._next_input_row(forced[t])
+        hidden = model.backbone(row, cache=cache)
+    manual = np.stack(manual, axis=0)
+    assert np.allclose(tf_logits, manual, atol=1e-4)
+
+
+def test_teacher_forced_logits_empty_returns_empty():
+    cfg = _tiny_config()
+    model = Model(cfg)
+    prompt = _random_prompt(cfg, seq=4)
+    empty = mx.zeros((0, cfg.n_codebooks), dtype=mx.int32)
+    logits = model.teacher_forced_logits(prompt, empty)
+    assert logits.shape == (0, cfg.n_codebooks, cfg.audio_vocab)
+
+
+def test_teacher_forced_with_own_greedy_tokens_is_consistent():
+    """Forcing the model's own greedy tokens -> step-t argmax == that token."""
+    cfg = _tiny_config()
+    model = Model(cfg)
+    prompt = _random_prompt(cfg, seq=5)
+    greedy = model.generate_codes(prompt, max_frames=4, temperature=0.0)
+    logits = model.teacher_forced_logits(prompt, greedy)
+    tf_argmax = np.asarray(mx.argmax(logits, axis=-1)).astype(np.int64)
+    assert np.array_equal(tf_argmax, np.asarray(greedy).astype(np.int64))
+
+
 def test_load_weights_reconciles_convert_keys():
     """A synthetic checkpoint in convert.py's key layout loads strictly."""
     cfg = _tiny_config()
