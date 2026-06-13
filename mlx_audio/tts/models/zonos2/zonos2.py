@@ -401,6 +401,10 @@ class Model(nn.Module):
         temperature: float = 0.0,
         top_k: int = 0,
         top_p: float = 1.0,
+        min_p: float = 0.0,
+        repetition_penalty: float = 1.0,
+        repetition_window: int = 50,
+        repetition_codebooks: int = 8,
         stop_on_eoa: bool = True,
         return_eos_frame: bool = False,
     ):
@@ -410,8 +414,14 @@ class Model(nn.Module):
             input_ids: prompt of shape ``[seq, frame_width]`` (or
                 ``[1, seq, frame_width]``) of int ids.
             max_frames: number of audio frames to generate.
-            temperature/top_k/top_p: per-codebook sampling controls (greedy when
-                ``temperature <= 0`` or ``top_k == 1``).
+            temperature/top_k/top_p/min_p: per-codebook sampling controls (greedy
+                when ``temperature <= 0`` or ``top_k == 1``).
+            repetition_penalty: flat factor (``>= 1``) applied to the logits of
+                tokens seen in the recent window of the SAME codebook (mirrors
+                upstream ``apply_repetition_penalty``). ``<= 1`` disables it.
+            repetition_window: how many recent frames feed the repetition penalty.
+            repetition_codebooks: only the first N codebooks get rep-penalty
+                (upstream default 8 of 9).
             stop_on_eoa: stop early when ``eoa_id`` appears in any codebook of a
                 sampled frame (delay-aware countdown of ``n_codebooks + 1``,
                 mirroring upstream ``TTSSequence``).
@@ -431,11 +441,20 @@ class Model(nn.Module):
         # softcap is already applied inside compute_logits; the sampler must not
         # re-apply it, so pass softcap=0 here.
         greedy = temperature <= 0.0 or top_k == 1
+        rep_penalty = max(float(repetition_penalty), 1.0)
+        rep_window = max(int(repetition_window), 0)
+        # Repetition penalty only matters on the stochastic path (greedy stays
+        # parity-exact); disable the rolling buffer entirely when greedy.
+        rep_active = (not greedy) and rep_penalty > 1.0 and rep_window > 0
         sampler = make_codebook_sampler(
             temperature=0.0 if greedy else temperature,
             top_k=top_k,
             top_p=top_p,
             softcap=0.0,
+            min_p=min_p,
+            repetition_penalty=rep_penalty,
+            repetition_codebooks=repetition_codebooks,
+            codebook_size=self.config.codebook_size,
         )
 
         # Prefill the prompt EXCEPT its last row as a block (this only needs to
@@ -455,7 +474,15 @@ class Model(nn.Module):
         eos_countdown = -1
         for step in range(max_frames):
             logits = self.backbone.compute_logits(last_hidden)  # [1, 1, C, V]
-            codes = sampler(logits[:, 0])  # [1, C]
+            # Rolling repetition-penalty window: the last ``rep_window`` emitted
+            # frames as a [1, C, window] buffer of per-codebook ids (upstream
+            # caps the active window at the number of generated frames so far).
+            rep_ids = None
+            if rep_active and frames:
+                window = frames[-rep_window:]
+                # stack frames [w, C] -> transpose to [C, w] -> [1, C, w]
+                rep_ids = mx.stack(window, axis=0).T[None]
+            codes = sampler(logits[:, 0], rep_ids)  # [1, C]
             codes = codes[0].astype(mx.int32)  # [C]
             frames.append(codes)
 
@@ -535,10 +562,19 @@ class Model(nn.Module):
         temperature: float = 0.0,
         top_k: int = 0,
         top_p: float = 1.0,
+        min_p: float = 0.0,
+        repetition_penalty: float = 1.0,
+        repetition_window: int = 50,
+        repetition_codebooks: int = 8,
         decode_audio: bool = True,
         prompt_ids: Optional[mx.array] = None,
     ):
         """Generate audio from ``text`` (or a prebuilt ``prompt_ids`` tensor).
+
+        ``temperature``/``top_k``/``top_p``/``min_p``/``repetition_penalty`` mirror
+        the upstream ``TTSSamplingParams``; pass the model defaults
+        (``temperature=1.15, top_k=106, top_p=0.0, min_p=0.18,
+        repetition_penalty=1.2``) for the clean, full-quality sampler.
 
         Returns ``(audio_codes [H, C], waveform [samples] | None)``.
         """
@@ -555,6 +591,10 @@ class Model(nn.Module):
             temperature=temperature,
             top_k=top_k,
             top_p=top_p,
+            min_p=min_p,
+            repetition_penalty=repetition_penalty,
+            repetition_window=repetition_window,
+            repetition_codebooks=repetition_codebooks,
             return_eos_frame=True,
         )
         waveform = (
