@@ -158,7 +158,12 @@ class Attention(nn.Module):
         if cache is not None and offset == 0:
             offset = cache.offset
 
-        gate = mx.sigmoid(self.gater(x))  # [B, T, num_heads]
+        # Headwise gate computed in fp32. The sigmoid is evaluated on the fp32
+        # gater pre-activation (the CUDA reference computes the gating sigmoid in
+        # fp32), so the per-head gate is not pre-quantized to bf16 before it scales
+        # the attention context. A bf16-rounded gate perturbs the gated context
+        # that feeds `wo`, nudging the residual onto bf16 argmax ties.
+        gate = mx.sigmoid(self.gater(x).astype(mx.float32))  # [B, T, num_heads]
 
         q = self.wq(x).reshape(B, T, self.num_heads, self.head_dim)
         k, v = self.wkv(x)  # each [B, T, kv_dim]
@@ -182,9 +187,13 @@ class Attention(nn.Module):
 
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=mask)
 
-        # [B, T, H, D] then headwise gating before the output projection.
+        # [B, T, H, D] then headwise gating before the output projection. The
+        # gate is fp32; cast the gated context back to the activation dtype so the
+        # `wo` projection stays a bf16 GEMM like upstream (only the gate itself is
+        # promoted, not the output matmul).
+        out_dtype = out.dtype
         out = out.transpose(0, 2, 1, 3)
-        out = out * gate[..., None]
+        out = (out * gate[..., None]).astype(out_dtype)
         out = out.reshape(B, T, self.num_heads * self.head_dim)
         return self.wo(out)
 
