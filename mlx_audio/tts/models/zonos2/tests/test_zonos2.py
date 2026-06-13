@@ -208,6 +208,280 @@ def test_generate_codes_returns_eos_frame_when_requested():
     assert eos_frame is None or isinstance(eos_frame, int)
 
 
+def _force_eoa_at(model: Model, cfg: ZONOS2Config, eoa_step: int):
+    """Patch the backbone logits so codebook 0 argmaxes to ``eoa_id`` at one step.
+
+    Returns a closure to install as ``backbone.compute_logits`` that emits a normal
+    (argmax 0) frame everywhere except at generation step ``eoa_step``, where
+    codebook 0's argmax is forced to ``eoa_id`` — driving the delay-aware EOS
+    countdown exactly like a real end-of-audio sample.
+    """
+    audio_vocab = cfg.audio_vocab
+    n_cb = cfg.n_codebooks
+    state = {"step": 0}
+
+    def fake_logits(hidden: mx.array) -> mx.array:
+        # hidden is [1, 1, dim]; emit [1, 1, n_cb, audio_vocab].
+        logits = np.zeros((1, 1, n_cb, audio_vocab), dtype=np.float32)
+        if state["step"] == eoa_step:
+            logits[0, 0, 0, cfg.eoa_id] = 10.0  # cb0 -> EOA at this step
+        state["step"] += 1
+        return mx.array(logits)
+
+    return fake_logits, state
+
+
+def test_generate_codes_eos_flush_countdown_and_frame():
+    """Forced EOA at a known step yields the upstream-aligned eos_frame + tail flush.
+
+    Mirrors upstream ``TTSSequence._check_eos`` / ``TTSReq.check_eos``: when EOA is
+    sampled in codebook ``c`` at generation step ``s``, ``eos_frame = s - c`` and the
+    loop runs ``n_codebooks + 1`` more frames (the delay tail) before stopping.
+    """
+    # eoa/pad ids must fall inside the tiny audio vocab (codebook_size + 2).
+    cfg = _tiny_config(eoa_id=8, audio_pad_id=9)
+    model = Model(cfg)
+    prompt = _random_prompt(cfg, seq=5)
+
+    eoa_step = 4
+    fake_logits, _ = _force_eoa_at(model, cfg, eoa_step)
+    model.backbone.compute_logits = fake_logits  # type: ignore[assignment]
+
+    codes, eos_frame = model.generate_codes(
+        prompt,
+        max_frames=64,
+        temperature=0.0,
+        top_k=1,
+        stop_on_eoa=True,
+        return_eos_frame=True,
+    )
+    produced = np.asarray(codes)
+    # EOA in codebook 0 at step 4 -> aligned eos_frame == 4 - 0 == 4.
+    assert eos_frame == eoa_step
+    # Countdown = n_codebooks + 1 extra frames after detection; detection frame is
+    # included, so total == eoa_step + 1 (detection) + n_codebooks (remaining tail).
+    assert produced.shape[0] == eoa_step + 1 + cfg.n_codebooks
+    # The detection frame's codebook 0 carries the EOA id.
+    assert int(produced[eoa_step, 0]) == cfg.eoa_id
+
+
+def test_decode_audio_truncates_to_eos_frame():
+    """``decode_audio`` shears then slices ``[:eos_frame]`` before DAC (no tail leak)."""
+    cfg = _tiny_config()
+    model = Model(cfg)
+    # 12 raw frames; an eos_frame of 5 must keep exactly 5 sheared output rows.
+    raw = mx.array(
+        np.random.randint(0, cfg.codebook_size, (12, cfg.n_codebooks)).astype(np.int32)
+    )
+    sheared_full = np.asarray(Model.shear_up(raw, cfg.audio_pad_id))
+
+    captured = {}
+
+    def fake_from_codes(dac_codes):
+        captured["shape"] = tuple(dac_codes.shape)  # [1, C, H]
+        # Return a dummy latent; decode() is also stubbed below.
+        return (mx.zeros((1, 1, dac_codes.shape[-1])),)
+
+    class _DummyDac:
+        class quantizer:  # noqa: N801 - mimic the attribute path dac.quantizer
+            from_codes = staticmethod(fake_from_codes)
+
+        @staticmethod
+        def decode(z):
+            return mx.zeros((1, z.shape[-1]))
+
+    model._dac = _DummyDac()  # bypass the real DAC download
+
+    model.decode_audio(raw, eos_frame=5)
+    # DAC saw exactly eos_frame (=5) frames along the time axis.
+    assert captured["shape"] == (1, cfg.n_codebooks, 5)
+    # And the kept rows are the first 5 of the full sheared tensor.
+    assert sheared_full.shape[0] == 12
+
+
+def test_project_speaker_shape():
+    cfg = _tiny_config(
+        speaker_enabled=True, speaker_embedding_dim=48, speaker_lda_dim=24
+    )
+    model = Model(cfg)
+    assert model.backbone.speaker_lda_projection.weight.shape == (24, 48)
+    assert model.backbone.speaker_projection.weight.shape == (cfg.dim, 24)
+    emb = mx.random.normal((1, cfg.speaker_embedding_dim))
+    out = model.backbone.project_speaker(emb)
+    assert out.shape == (1, cfg.dim)
+
+
+def test_with_speaker_frames_prefix_layout():
+    cfg = _tiny_config(
+        speaker_enabled=True,
+        speaker_embedding_dim=48,
+        speaker_lda_dim=24,
+        speaker_background_token_enabled=True,
+        accurate_mode_token_enabled=True,
+        speaking_rate_num_buckets=2,
+        quality_buckets={"a": ("0-1", "1+"), "b": ("0-1", "1+")},
+    )
+    model = Model(cfg)
+    prompt = _random_prompt(cfg, seq=5)
+    new_prompt, pos = model.with_speaker_frames(prompt)
+    assert pos == 0
+    assert new_prompt.shape == (5 + 2, cfg.n_codebooks + 1)  # slot + bg marker
+    np_new = np.asarray(new_prompt)
+    pad = cfg.audio_pad_id
+    # Row 0: speaker slot (all audio_pad + text_vocab in the text column).
+    assert np.all(np_new[0, : cfg.n_codebooks] == pad)
+    assert int(np_new[0, cfg.n_codebooks]) == cfg.text_vocab
+    # Row 1: clean-background marker (audio_pad + clean-bg token).
+    assert np.all(np_new[1, : cfg.n_codebooks] == pad)
+    assert int(np_new[1, cfg.n_codebooks]) == model._clean_background_token()
+    # The rest is the original prompt verbatim.
+    assert np.array_equal(np_new[2:], np.asarray(prompt))
+
+
+def test_generate_codes_with_speaker_embedding_runs():
+    cfg = _tiny_config(
+        speaker_enabled=True, speaker_embedding_dim=48, speaker_lda_dim=24
+    )
+    model = Model(cfg)
+    prompt = _random_prompt(cfg, seq=6)
+    new_prompt, pos = model.with_speaker_frames(prompt)
+    emb = mx.random.normal((cfg.speaker_embedding_dim,))
+    codes = model.generate_codes(
+        new_prompt,
+        max_frames=4,
+        temperature=0.0,
+        top_k=1,
+        stop_on_eoa=False,
+        speaker_embedding=emb,
+        speaker_position=pos,
+    )
+    assert codes.shape == (4, cfg.n_codebooks)
+    assert codes.dtype == mx.int32
+
+
+def test_speaker_injection_changes_first_logits():
+    """Injecting a speaker embedding at position 0 perturbs the prefill hidden state."""
+    cfg = _tiny_config(
+        speaker_enabled=True, speaker_embedding_dim=48, speaker_lda_dim=24
+    )
+    model = Model(cfg)
+    prompt = _random_prompt(cfg, seq=5)[None]
+    proj = model.backbone.project_speaker(
+        mx.random.normal((1, cfg.speaker_embedding_dim))
+    )
+
+    base = model.backbone(prompt)
+    injected = model.backbone(prompt, speaker_emb=proj, speaker_pos=0)
+    # Replacing the position-0 embedding must change the output (not a no-op).
+    assert not bool(mx.allclose(base, injected))
+
+
+def test_trim_leading_silence_helper():
+    sr = 44100
+    wav = mx.array(
+        np.concatenate([np.zeros(2000, np.float32), (np.ones(1000, np.float32) * 0.4)])
+    )
+    trimmed = Model._trim_leading_silence(wav, threshold=0.01, keep_samples=128)
+    # Drops the leading 2000 silent samples minus the 128 kept as lead-in.
+    assert trimmed.shape[0] == 3000 - (2000 - 128)
+    # All-silent input is returned unchanged (nothing crosses the threshold).
+    silent = mx.zeros((500,))
+    assert Model._trim_leading_silence(silent).shape[0] == 500
+
+
+def test_speaker_projection_absent_without_speaker_config():
+    cfg = _tiny_config(speaker_enabled=False)
+    model = Model(cfg)
+    assert model.backbone.speaker_projection is None
+    assert model.backbone.speaker_lda_projection is None
+
+
+def _speaker_enabled_config(**ov) -> ZONOS2Config:
+    return _tiny_config(
+        speaker_enabled=True, speaker_embedding_dim=48, speaker_lda_dim=24, **ov
+    )
+
+
+def _ckpt_keys_no_prefix(model: Model) -> dict:
+    return {k[len("backbone.") :]: v for k, v in tree_flatten(model.parameters())}
+
+
+def test_base_checkpoint_loads_strict_via_speaker_backfill():
+    """A base checkpoint (no speaker keys) still loads strict (backfill keeps init)."""
+    cfg = _speaker_enabled_config()
+    src = Model(cfg)
+    base_ckpt = {
+        k: v
+        for k, v in _ckpt_keys_no_prefix(src).items()
+        if not k.startswith("speaker_")
+    }
+    assert not any("speaker" in k for k in base_ckpt)
+    dst = Model(cfg)
+    # Must NOT raise despite the model carrying speaker params absent from the ckpt.
+    dst.load_weights(list(base_ckpt.items()), strict=True)
+
+
+def test_strict_load_still_catches_missing_non_speaker_key():
+    """The speaker backfill must not mask a genuinely missing backbone key."""
+    cfg = _speaker_enabled_config()
+    src = Model(cfg)
+    ckpt = {
+        k: v
+        for k, v in _ckpt_keys_no_prefix(src).items()
+        if not k.startswith("speaker_")
+    }
+    drop = next(k for k in ckpt if "multi_output" in k)
+    del ckpt[drop]
+    dst = Model(cfg)
+    try:
+        dst.load_weights(list(ckpt.items()), strict=True)
+        raised = False
+    except Exception:
+        raised = True
+    assert raised, "a missing non-speaker key must still fail the strict load"
+
+
+def test_load_speaker_weights_validates_shape_and_completeness():
+    cfg = _speaker_enabled_config()
+    good = {
+        "speaker_lda_projection.weight": mx.zeros((24, 48)),
+        "speaker_lda_projection.bias": mx.zeros((24,)),
+        "speaker_projection.weight": mx.zeros((cfg.dim, 24)),
+        "speaker_projection.bias": mx.zeros((cfg.dim,)),
+    }
+    Model(cfg).load_speaker_weights(list(good.items()))  # OK
+
+    wrong = dict(good)
+    wrong["speaker_projection.weight"] = mx.zeros((cfg.dim, 99))  # bad in-dim
+    try:
+        Model(cfg).load_speaker_weights(list(wrong.items()))
+        bad_shape_raised = False
+    except ValueError:
+        bad_shape_raised = True
+    assert bad_shape_raised
+
+    incomplete = [(k, v) for k, v in good.items() if "bias" not in k]
+    try:
+        Model(cfg).load_speaker_weights(incomplete)
+        incomplete_raised = False
+    except ValueError:
+        incomplete_raised = True
+    assert incomplete_raised
+
+
+def test_speaker_injection_out_of_range_position_raises():
+    cfg = _speaker_enabled_config()
+    model = Model(cfg)
+    prompt = _random_prompt(cfg, seq=4)[None]
+    proj = model.backbone.project_speaker(mx.zeros((1, cfg.speaker_embedding_dim)))
+    try:
+        model.backbone(prompt, speaker_emb=proj, speaker_pos=99)
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised, "out-of-range speaker_pos must raise, not silently no-op"
+
+
 def test_load_weights_reconciles_convert_keys():
     """A synthetic checkpoint in convert.py's key layout loads strictly."""
     cfg = _tiny_config()
