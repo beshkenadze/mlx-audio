@@ -4,6 +4,25 @@ import mlx.nn as nn
 from .config import EcapaTdnnConfig
 
 
+def _reflect_pad_time(x: mx.array, pad: int) -> mx.array:
+    """Reflect-pad an ``[B, L, C]`` tensor by ``pad`` frames on each side of L.
+
+    Matches ``torch.nn.functional.pad(..., mode="reflect")`` (the boundary frame
+    itself is excluded from the reflection), including its ``pad < L`` requirement:
+    a too-short input raises rather than silently under-padding (which would yield
+    a wrong-length, non-reflected tensor that diverges from torch without error).
+    """
+    if pad <= 0:
+        return x
+    if x.shape[1] <= pad:
+        raise ValueError(
+            f"sequence too short for reflect pad: length {x.shape[1]} <= pad {pad}"
+        )
+    left = x[:, 1 : pad + 1, :][:, ::-1, :]
+    right = x[:, -(pad + 1) : -1, :][:, ::-1, :]
+    return mx.concatenate([left, x, right], axis=1)
+
+
 class TDNNBlock(nn.Module):
     def __init__(
         self,
@@ -11,20 +30,31 @@ class TDNNBlock(nn.Module):
         out_channels: int,
         kernel_size: int,
         dilation: int = 1,
+        padding_mode: str = "zeros",
     ):
         super().__init__()
-        padding = (kernel_size - 1) * dilation // 2
+        if padding_mode not in ("zeros", "reflect"):
+            raise ValueError(
+                f"padding_mode must be 'zeros' or 'reflect', got {padding_mode!r}"
+            )
+        self.same_pad = (kernel_size - 1) * dilation // 2
+        self.padding_mode = padding_mode
+        # Reflect "same" padding is applied manually (MLX Conv1d only zero-pads),
+        # so the conv itself pads internally only in the default "zeros" mode.
+        conv_pad = 0 if padding_mode == "reflect" else self.same_pad
         self.conv = nn.Conv1d(
             in_channels,
             out_channels,
             kernel_size,
-            padding=padding,
+            padding=conv_pad,
             dilation=dilation,
             bias=True,
         )
         self.norm = nn.BatchNorm(out_channels)
 
     def __call__(self, x: mx.array) -> mx.array:
+        if self.padding_mode == "reflect":
+            x = _reflect_pad_time(x, self.same_pad)
         return self.norm(nn.relu(self.conv(x)))
 
 
@@ -35,6 +65,7 @@ class Res2NetBlock(nn.Module):
         kernel_size: int = 3,
         dilation: int = 1,
         scale: int = 8,
+        padding_mode: str = "zeros",
     ):
         super().__init__()
         if channels % scale != 0:
@@ -44,7 +75,8 @@ class Res2NetBlock(nn.Module):
         self.scale = scale
         hidden = channels // scale
         self.blocks = [
-            TDNNBlock(hidden, hidden, kernel_size, dilation) for _ in range(scale - 1)
+            TDNNBlock(hidden, hidden, kernel_size, dilation, padding_mode)
+            for _ in range(scale - 1)
         ]
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -77,13 +109,14 @@ class SERes2NetBlock(nn.Module):
         dilation: int = 1,
         res2net_scale: int = 8,
         se_channels: int = 128,
+        padding_mode: str = "zeros",
     ):
         super().__init__()
-        self.tdnn1 = TDNNBlock(channels, channels, 1)
+        self.tdnn1 = TDNNBlock(channels, channels, 1, padding_mode=padding_mode)
         self.res2net_block = Res2NetBlock(
-            channels, kernel_size, dilation, res2net_scale
+            channels, kernel_size, dilation, res2net_scale, padding_mode
         )
-        self.tdnn2 = TDNNBlock(channels, channels, 1)
+        self.tdnn2 = TDNNBlock(channels, channels, 1, padding_mode=padding_mode)
         self.se_block = SEBlock(channels, se_channels)
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -100,11 +133,12 @@ class AttentiveStatisticsPooling(nn.Module):
         channels: int,
         attention_channels: int = 128,
         global_context: bool = False,
+        padding_mode: str = "zeros",
     ):
         super().__init__()
         self.global_context = global_context
         tdnn_in = channels * 3 if global_context else channels
-        self.tdnn = TDNNBlock(tdnn_in, attention_channels, 1)
+        self.tdnn = TDNNBlock(tdnn_in, attention_channels, 1, padding_mode=padding_mode)
         self.conv = nn.Conv1d(attention_channels, channels, 1)
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -134,14 +168,18 @@ class EcapaTdnnBackbone(nn.Module):
     def __init__(self, config: EcapaTdnnConfig):
         super().__init__()
         ch = config.channels
+        pm = config.conv_padding_mode
 
-        self.block0 = TDNNBlock(config.input_size, ch, config.kernel_sizes[0])
+        self.block0 = TDNNBlock(
+            config.input_size, ch, config.kernel_sizes[0], padding_mode=pm
+        )
         self.block1 = SERes2NetBlock(
             ch,
             config.kernel_sizes[1],
             config.dilations[1],
             config.res2net_scale,
             config.se_channels,
+            pm,
         )
         self.block2 = SERes2NetBlock(
             ch,
@@ -149,6 +187,7 @@ class EcapaTdnnBackbone(nn.Module):
             config.dilations[2],
             config.res2net_scale,
             config.se_channels,
+            pm,
         )
         self.block3 = SERes2NetBlock(
             ch,
@@ -156,14 +195,16 @@ class EcapaTdnnBackbone(nn.Module):
             config.dilations[3],
             config.res2net_scale,
             config.se_channels,
+            pm,
         )
         self.blocks = [self.block1, self.block2, self.block3]
 
-        self.mfa = TDNNBlock(ch * 3, ch * 3, config.kernel_sizes[4])
+        self.mfa = TDNNBlock(ch * 3, ch * 3, config.kernel_sizes[4], padding_mode=pm)
         self.asp = AttentiveStatisticsPooling(
             ch * 3,
             config.attention_channels,
             config.global_context,
+            pm,
         )
         self.asp_bn = nn.BatchNorm(ch * 6)
         self.fc = nn.Conv1d(ch * 6, config.embed_dim, 1)

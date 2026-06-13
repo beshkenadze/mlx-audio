@@ -1,43 +1,47 @@
-"""ZONOS2 voice (speaker) encoder: ref-wav -> 2048-D speaker features.
+"""ZONOS2 voice (speaker) encoder: ref-wav -> 2048-D x-vector speaker embedding.
 
-Mirrors the upstream ``zonos2.models.speaker_cloning.Qwen3SpeakerEmbedding``
-preprocessing (``_make_mel`` / ``mel_transform``) and wraps a Qwen3 transformer
-backbone that consumes the log-mel features and returns a per-frame hidden state
-of width ``2048`` (the ``last_hidden_state`` the conditioning stack expects).
+The HF checkpoint ``marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B`` referenced by
+the upstream loader is — despite its name — an **ECAPA-TDNN x-vector speaker
+encoder**, not a Qwen3 transformer. Its on-disk ``config.json`` declares
+``architectures: ["EcapaTdnnSpeakerEncoder"]`` / ``model_type:
+"ecapa_tdnn_speaker_encoder"`` with ``mel_dim=128`` -> ``enc_dim=2048`` and the
+weight tensors are plain ``Conv1d`` blocks (``blocks.*``, ``mfa``, ``asp``,
+``fc``) with no transformer / no BatchNorm. The module name is the source of the
+"Qwen3" misnomer; the shipped architecture is the ground truth.
 
-Upstream reference (ground truth):
-  ``python/zonos2/models/speaker_cloning.py`` -> ``Qwen3SpeakerEmbedding`` which
-  builds the mel with ``torchaudio.transforms.MelSpectrogram(sample_rate=24000,
-  n_fft=1024, win_length=1024, hop_length=256, n_mels=128, f_min=0, f_max=12000,
-  power=1.0, center=False, norm="slaney", mel_scale="slaney")``, reflect-pads the
-  waveform by ``(n_fft - hop_length)//2`` on each side, then
-  ``log(clamp(mel, min=1e-5))`` and transposes to ``[B, frames, 128]``.
+This module therefore wires the (unchanged) log-mel ``VoiceMelFrontend`` into the
+shared MLX ``EcapaTdnnBackbone`` (``mlx_audio.codec.models.ecapa_tdnn``) and
+returns a *pooled* utterance-level x-vector ``[B, 2048]`` (NOT a per-frame
+sequence). The class is still named ``Qwen3VoiceEmbedding`` for API stability.
 
-IMPORTANT discrepancy (documented for the Phase-D coordinator):
-  The HF repo ``marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B`` referenced by the
-  upstream loader is, by its on-disk ``config.json`` / ``modeling_ecapa_tdnn.py``,
-  an **ECAPA-TDNN** x-vector encoder (``architectures: ["EcapaTdnnSpeakerEncoder"]``,
-  ``mel_dim=128`` -> ``enc_dim=2048``) whose ``last_hidden_state`` is a *pooled*
-  ``[B, 2048]`` vector, not a per-frame ``[B, frames, 2048]`` sequence. The repo name
-  ("Qwen3 ... 1.7B") does not match the shipped architecture. This module follows
-  the ZONOS2 ``CONTRACT.md`` API (Qwen3 backbone -> ``[B, frames, 2048]``); whether
-  the integration ultimately loads the ECAPA-TDNN checkpoint or a true Qwen3
-  backbone is a Phase-D wiring decision. The mel frontend here is identical for
-  both (the ECAPA feature extractor uses the exact same parameters).
+Frontend reference (ground truth), matching the checkpoint's
+``feature_extraction_ecapa_tdnn.py`` exactly:
+  reflect-pad the waveform by ``(n_fft - hop_length)//2`` on both sides, STFT with
+  a periodic Hann window (``win_length = n_fft``, ``center=False``), magnitude
+  spectrum projected through a slaney mel filterbank (slaney norm + slaney mel
+  scale), ``log(clamp(mel, min=1e-5))``, transposed to ``[B, frames, 128]``.
+  SR 24000, n_fft 1024, hop 256, n_mels 128, fmin 0, fmax 12000.
+
+Backbone reference (ground truth): the checkpoint's ``modeling_ecapa_tdnn.py``
+``EcapaTdnnSpeakerEncoder.forward(input_values=mel)`` — block0 (TDNN) + 3
+SE-Res2Net blocks + MFA + attentive-statistics pooling + a final ``fc`` conv ->
+``[B, enc_dim]``. There is no BatchNorm in the checkpoint; the shared
+``EcapaTdnnBackbone`` carries BatchNorm layers which the weight converter
+neutralises to identity (a uniform, cosine-invariant scale), so the reused module
+reproduces the checkpoint to high fidelity.
 """
 
 from __future__ import annotations
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.qwen3 import ModelArgs as Qwen3ModelArgs
-from mlx_lm.models.qwen3 import Qwen3Model
 
+from mlx_audio.codec.models.ecapa_tdnn import EcapaTdnnBackbone, EcapaTdnnConfig
 from mlx_audio.dsp import hanning, mel_filters, stft
 
 from .config import ZONOS2Config
 
-# Frontend constants — mirror Qwen3SpeakerEmbedding / EcapaTdnnFeatureExtractor.
+# Frontend constants — mirror EcapaTdnnFeatureExtractor / Qwen3SpeakerEmbedding.
 _TARGET_SAMPLE_RATE = 24_000
 _N_FFT = 1024
 _HOP_LENGTH = 256
@@ -46,6 +50,18 @@ _N_MELS = 128
 _F_MIN = 0.0
 _F_MAX = 12_000.0
 _LOG_CLAMP_MIN = 1e-5
+
+# ECAPA-TDNN encoder geometry (checkpoint config.json: enc_* fields).
+# enc_channels = [512, 512, 512, 512, 1536]: block0 (512) + 3 SE-Res2Net blocks
+# (512 each) feed the MFA over their concatenation (3*512 = 1536). The shared
+# EcapaTdnnBackbone derives mfa/asp/fc widths from ``channels`` (= 512 here); the
+# embed_dim (checkpoint enc_dim 2048) is taken from config.speaker_embedding_dim.
+_ENC_CHANNELS = 512
+_ENC_KERNEL_SIZES = [5, 3, 3, 3, 1]
+_ENC_DILATIONS = [1, 2, 3, 4, 1]
+_ENC_RES2NET_SCALE = 8
+_ENC_SE_CHANNELS = 128
+_ENC_ATTENTION_CHANNELS = 128
 
 
 def _reflect_pad_1d(x: mx.array, pad: int) -> mx.array:
@@ -68,7 +84,7 @@ def _reflect_pad_1d(x: mx.array, pad: int) -> mx.array:
 
 
 class VoiceMelFrontend(nn.Module):
-    """Log-mel frontend matching ``Qwen3SpeakerEmbedding._make_mel``.
+    """Log-mel frontend matching ``EcapaTdnnFeatureExtractor._compute_mel``.
 
     Produces ``[B, frames, 128]`` magnitude log-mel features:
       * reflect-pad the waveform by ``(n_fft - hop_length)//2`` on both sides;
@@ -148,34 +164,38 @@ def _resample_linear(wav: mx.array, orig_sr: int, target_sr: int) -> mx.array:
     return wav[left] * (1.0 - frac) + wav[right] * frac
 
 
-def _qwen3_args_from_config(config: ZONOS2Config) -> Qwen3ModelArgs:
-    """Build Qwen3 backbone args sized to the ZONOS2 speaker-embedding width."""
-    return Qwen3ModelArgs(
-        model_type="qwen3",
-        hidden_size=config.speaker_embedding_dim,
-        num_hidden_layers=config.n_layers,
-        intermediate_size=config.intermediate_size,
-        num_attention_heads=config.num_qo_heads,
-        rms_norm_eps=config.norm_eps,
-        # vocab_size is only used for the (unused) token embedding table; keep small.
-        vocab_size=1,
-        num_key_value_heads=config.n_kv_heads,
-        max_position_embeddings=config.max_seqlen,
-        rope_theta=config.rope_theta,
-        head_dim=config.head_dim,
-        tie_word_embeddings=True,
+def ecapa_config_from_zonos2(config: ZONOS2Config) -> EcapaTdnnConfig:
+    """Build the shared ``EcapaTdnnConfig`` for the ZONOS2 speaker encoder.
+
+    The widths come from the checkpoint's ``config.json`` (``enc_*`` fields). The
+    embedding width tracks ``config.speaker_embedding_dim`` (2048 for the released
+    checkpoint) so the pooled x-vector matches the conditioning-stack contract.
+    ``global_context=True`` because the reference ASP always concatenates
+    ``[x, mean, std]`` before the attention TDNN. ``conv_padding_mode="reflect"``
+    matches the checkpoint's ``padding="same", padding_mode="reflect"`` convs
+    (without it the conv edge frames diverge: cosine ~0.988 vs ~1.000).
+    """
+    return EcapaTdnnConfig(
+        input_size=_N_MELS,
+        channels=_ENC_CHANNELS,
+        embed_dim=config.speaker_embedding_dim,
+        kernel_sizes=list(_ENC_KERNEL_SIZES),
+        dilations=list(_ENC_DILATIONS),
+        attention_channels=_ENC_ATTENTION_CHANNELS,
+        res2net_scale=_ENC_RES2NET_SCALE,
+        se_channels=_ENC_SE_CHANNELS,
+        global_context=True,
+        conv_padding_mode="reflect",
     )
 
 
 class Qwen3VoiceEmbedding(nn.Module):
-    """Mel frontend + Qwen3 backbone -> per-frame ``[1, frames, 2048]`` features.
+    """Mel frontend + ECAPA-TDNN backbone -> pooled ``[B, 2048]`` x-vector.
 
-    The backbone consumes the ``[1, frames, n_mels]`` log-mel via an input
-    projection (``n_mels`` -> ``hidden``) fed as ``input_embeddings`` so the
-    Qwen3 transformer runs over the mel frames, returning ``last_hidden_state``
-    ``[1, frames, hidden]`` (``hidden == speaker_embedding_dim``, 2048 for the
-    1.7B config). One reference clip per call. See the module docstring for the
-    upstream-checkpoint caveat.
+    Despite the legacy class name (kept for API stability — the HF repo is named
+    "Qwen3-Voice-Embedding"), the backbone is an ECAPA-TDNN speaker encoder, the
+    architecture actually shipped in the checkpoint. ``__call__`` returns a single
+    utterance-level speaker embedding per reference clip, NOT a per-frame sequence.
     """
 
     def __init__(self, config: ZONOS2Config) -> None:
@@ -183,33 +203,24 @@ class Qwen3VoiceEmbedding(nn.Module):
         self.config = config
         self.target_sample_rate = _TARGET_SAMPLE_RATE
         self.frontend = VoiceMelFrontend(config)
-        args = _qwen3_args_from_config(config)
-        self.hidden_size = args.hidden_size
-        # mel (128) -> hidden projection feeding the transformer as input_embeddings.
-        self.mel_proj = nn.Linear(_N_MELS, args.hidden_size, bias=False)
-        self.backbone = Qwen3Model(args)
+        self.embed_dim = config.speaker_embedding_dim
+        self.backbone = EcapaTdnnBackbone(ecapa_config_from_zonos2(config))
 
     def __call__(self, wav: mx.array, sample_rate: int) -> mx.array:
-        """Reference waveform -> ``[1, frames, hidden]`` speaker features.
+        """Reference waveform -> pooled ``[B, embed_dim]`` x-vector.
 
         Matches upstream ``Qwen3SpeakerEmbedding.prepare_input`` semantics: a 2-D
         input is a single multi-channel clip ``[C, T]`` and is downmixed to mono
         by averaging channels (NOT a batch of clips). One reference clip in, one
-        ``[1, frames, hidden]`` feature sequence out.
+        ``[1, embed_dim]`` speaker embedding out.
 
         Args:
             wav: ``[T]`` mono or ``[C, T]`` multi-channel waveform.
             sample_rate: Sample rate of ``wav``; resampled to 24 kHz if different.
         """
         wav = self._prepare_input(wav, sample_rate)
-        mel = self.frontend(wav)
-        h = self.mel_proj(mel)
-        # NOTE: Qwen3Model applies a causal attention mask over the mel frames, so
-        # frame t only attends to <= t. A bidirectional pass is closer to a true
-        # utterance-level speaker encoder; reconciling the backbone choice (and the
-        # ECAPA-TDNN checkpoint discrepancy noted in the module docstring) is a
-        # Phase-D coordinator decision.
-        return self.backbone(None, cache=None, input_embeddings=h)
+        mel = self.frontend(wav)  # [1, frames, n_mels]
+        return self.backbone(mel)  # [1, embed_dim]
 
     def _prepare_input(self, wav: mx.array, sample_rate: int) -> mx.array:
         """Downmix to mono, resample to 24 kHz, return batched ``[1, T]``."""

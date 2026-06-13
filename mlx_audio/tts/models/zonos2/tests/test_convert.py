@@ -15,8 +15,10 @@ import numpy as np
 from mlx_audio.tts.models.zonos2 import convert as convert_mod
 from mlx_audio.tts.models.zonos2.convert import (
     SWITCH_MLP_PREFIX,
+    _flat_params,
     _torch_state_dict_to_mx,
     convert,
+    remap_ecapa_state_dict,
     remap_state_dict,
     split_sonic_w13,
 )
@@ -318,3 +320,145 @@ def test_remap_raises_on_target_key_collision():
     }
     with pytest.raises(ValueError):
         remap_state_dict(weights, mx.bfloat16)
+
+
+# ── ECAPA-TDNN voice-embedder remap ───────────────────────────────────────────
+
+
+def _ecapa_backbone_params() -> dict[str, mx.array]:
+    """Flat param tree of the real ZONOS2 ECAPA backbone (the expected key set)."""
+    from mlx_audio.tts.models.zonos2.config import ZONOS2Config
+    from mlx_audio.tts.models.zonos2.speaker_encoder import Qwen3VoiceEmbedding
+
+    return _flat_params(Qwen3VoiceEmbedding(ZONOS2Config()).backbone)
+
+
+def _fake_hf_ecapa_checkpoint(params: dict[str, mx.array]) -> dict[str, mx.array]:
+    """Build a synthetic HF (torch-layout) ECAPA state-dict from a backbone tree.
+
+    Mirrors the real checkpoint layout: conv-only keys (no BatchNorm), the
+    ``block{i}`` attribute family renamed to ``blocks.{i}`` (the ``self.blocks``
+    list-alias family is NOT a separate checkpoint family, so it is skipped), and
+    conv weights stored as torch ``[out, in, k]``.
+    """
+    parent = lambda k: k.split(".")[-2] if len(k.split(".")) >= 2 else ""
+    hf: dict[str, mx.array] = {}
+    for key, ref in params.items():
+        leaf = key.rsplit(".", 1)[-1]
+        # Skip BatchNorm params (checkpoint has none) and the blocks.N list alias.
+        if parent(key) == "norm" or key.startswith("asp_bn"):
+            continue
+        if key.split(".")[0] == "blocks":
+            continue
+        hf_key = key
+        for i in range(4):
+            if hf_key.startswith(f"block{i}."):
+                hf_key = f"blocks.{i}." + hf_key[len(f"block{i}.") :]
+                break
+        if leaf == "weight" and ref.ndim == 3:
+            # MLX [out, k, in] -> torch [out, in, k]
+            value = mx.random.normal((ref.shape[0], ref.shape[2], ref.shape[1]))
+        else:
+            value = mx.random.normal(ref.shape)
+        hf[hf_key] = value
+    return hf
+
+
+def test_remap_ecapa_maps_keys_and_transposes_convs():
+    params = _ecapa_backbone_params()
+    hf = _fake_hf_ecapa_checkpoint(params)
+
+    out = remap_ecapa_state_dict(hf, params, mx.float32)
+
+    # Every backbone key is present and correctly shaped.
+    assert set(out) == set(params)
+    for key, ref in params.items():
+        assert tuple(out[key].shape) == tuple(ref.shape)
+
+    # A conv weight is transposed torch [out, in, k] -> MLX [out, k, in] by VALUE,
+    # not merely reshaped (catches a wrong axis permutation that preserves shape).
+    src = hf["blocks.0.conv.weight"]  # block0 -> blocks.0 in HF layout
+    assert bool(mx.array_equal(out["block0.conv.weight"], src.transpose(0, 2, 1)))
+
+
+def test_remap_ecapa_resolves_blocks_list_alias_by_value():
+    params = _ecapa_backbone_params()
+    hf = _fake_hf_ecapa_checkpoint(params)
+
+    out = remap_ecapa_state_dict(hf, params, mx.float32)
+
+    # The backbone aliases block{1,2,3} as the self.blocks list (blocks.{0,1,2});
+    # the list-alias keys must carry the SAME values as their block{i+1} source.
+    alias_keys = [
+        k for k in params if k.split(".")[0] == "blocks" and k.split(".")[1].isdigit()
+    ]
+    assert alias_keys, "expected blocks.N list-alias keys in the shared backbone"
+    for alias in alias_keys:
+        parts = alias.split(".")
+        source = f"block{int(parts[1]) + 1}." + ".".join(parts[2:])
+        assert bool(mx.array_equal(out[alias], out[source])), alias
+
+
+def test_remap_ecapa_injects_identity_batchnorm():
+    params = _ecapa_backbone_params()
+    hf = _fake_hf_ecapa_checkpoint(params)
+
+    out = remap_ecapa_state_dict(hf, params, mx.float32)
+
+    # The checkpoint carries no BatchNorm; every BN param must be identity.
+    bn_keys = [k for k in params if ".norm." in k or k.startswith("asp_bn")]
+    assert bn_keys, "expected BatchNorm params in the shared backbone"
+    for key in bn_keys:
+        leaf = key.rsplit(".", 1)[-1]
+        arr = out[key]
+        if leaf in ("weight", "running_var"):
+            assert bool(mx.all(arr == 1.0)), key
+        else:  # bias / running_mean
+            assert bool(mx.all(arr == 0.0)), key
+
+
+def test_remap_ecapa_rejects_unknown_key():
+    import pytest
+
+    params = _ecapa_backbone_params()
+    hf = _fake_hf_ecapa_checkpoint(params)
+    hf["blocks.0.conv.bogus"] = mx.zeros((4,))
+
+    with pytest.raises(ValueError):
+        remap_ecapa_state_dict(hf, params, mx.float32)
+
+
+def test_remap_ecapa_rejects_shape_mismatch():
+    import pytest
+
+    params = _ecapa_backbone_params()
+    hf = _fake_hf_ecapa_checkpoint(params)
+    hf["blocks.0.conv.bias"] = mx.zeros((7,))  # wrong size
+
+    with pytest.raises(ValueError):
+        remap_ecapa_state_dict(hf, params, mx.float32)
+
+
+def test_remap_ecapa_rejects_missing_conv_weight():
+    import pytest
+
+    params = _ecapa_backbone_params()
+    hf = _fake_hf_ecapa_checkpoint(params)
+    # A genuine checkpoint conv tensor is absent -> the fill pass must raise loudly
+    # rather than silently leaving a random/identity conv (only BN keys may be
+    # back-filled, and conv keys have no list-alias source for block0).
+    del hf["blocks.0.conv.weight"]
+
+    with pytest.raises(ValueError):
+        remap_ecapa_state_dict(hf, params, mx.float32)
+
+
+def test_remap_ecapa_dtype_policy_norms_fp32():
+    params = _ecapa_backbone_params()
+    hf = _fake_hf_ecapa_checkpoint(params)
+
+    out = remap_ecapa_state_dict(hf, params, mx.bfloat16)
+
+    assert out["block0.conv.weight"].dtype == mx.bfloat16
+    assert out["block0.norm.running_mean"].dtype == mx.float32
+    assert out["asp_bn.running_var"].dtype == mx.float32

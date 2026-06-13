@@ -305,39 +305,223 @@ def convert(pth_path: str | Path, out_dir: str | Path, dtype: str = "bfloat16") 
     return out_dir
 
 
-# ── Qwen3 voice embedder conversion ───────────────────────────────────────────
+# ── ECAPA-TDNN voice embedder conversion ──────────────────────────────────────
+#
+# Despite the HF repo name "Qwen3-Voice-Embedding-12Hz-1.7B", the shipped
+# checkpoint is an ECAPA-TDNN x-vector speaker encoder (config.json:
+# ``architectures: ["EcapaTdnnSpeakerEncoder"]``, ``mel_dim=128`` -> ``enc_dim=2048``).
+# We remap its plain Conv1d state-dict onto the shared MLX ``EcapaTdnnBackbone``
+# (mlx_audio.codec.models.ecapa_tdnn).
+#
+# Key remap (HF reference layout -> MLX EcapaTdnnBackbone layout):
+#   blocks.0.conv.{weight,bias}        -> block0.conv.{weight,bias}
+#   blocks.{1,2,3}.<rest>              -> block{1,2,3}.<rest>   (tdnn1/tdnn2/
+#                                         res2net_block.blocks.N/se_block.conv1|2)
+#   mfa.conv.{weight,bias}             -> mfa.conv.{weight,bias}
+#   asp.tdnn.conv.* / asp.conv.*       -> asp.tdnn.conv.* / asp.conv.*
+#   fc.{weight,bias}                   -> fc.{weight,bias}
+# Conv1d weights are torch ``[out, in, k]`` -> MLX ``[out, k, in]`` (transpose
+# axes 0,2,1). The HF checkpoint has NO BatchNorm; the shared backbone carries BN
+# layers, which we fill with identity stats (running_mean=0, running_var=1,
+# weight=1, bias=0) so they reduce to a uniform, cosine-invariant scale.
+
+_ECAPA_VOICE_REPO = "marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B"
+
+# Norms / scale-and-bias tensors stay fp32 for numerical parity; convs cast.
+_ECAPA_FP32_SUBSTRINGS = ("norm", "running_mean", "running_var", "asp_bn")
+
+
+def _transpose_conv1d_weight(value: mx.array) -> mx.array:
+    """torch Conv1d weight ``[out, in, k]`` -> MLX Conv1d weight ``[out, k, in]``."""
+    if value.ndim != 3:
+        raise ValueError(f"Expected rank-3 Conv1d weight, got shape {value.shape}")
+    return value.transpose(0, 2, 1)
+
+
+def _remap_ecapa_key(key: str) -> str:
+    """Map a HF ``EcapaTdnnSpeakerEncoder`` key to the MLX ``EcapaTdnnBackbone`` key."""
+    for i in range(4):
+        prefix = f"blocks.{i}."
+        if key.startswith(prefix):
+            return f"block{i}." + key[len(prefix) :]
+    return key
+
+
+def remap_ecapa_state_dict(
+    weights: Dict[str, mx.array],
+    backbone_params: Dict[str, mx.array],
+    weight_dtype: mx.Dtype,
+) -> Dict[str, mx.array]:
+    """Remap a HF ECAPA state-dict onto the MLX ``EcapaTdnnBackbone`` layout.
+
+    Pure MLX (torch-free, unit-testable). ``backbone_params`` is the flat
+    ``{key: array}`` parameter tree of a freshly-built ``EcapaTdnnBackbone`` and is
+    the single source of truth for the expected key set: every conv key is filled
+    from the (transposed) HF tensor and every remaining (BatchNorm) key is filled
+    with identity stats.
+
+    The shared backbone registers the SE-Res2Net blocks twice — as
+    ``block{1,2,3}`` attributes and as a ``self.blocks`` list (``blocks.{0,1,2}``)
+    that aliases the same arrays. The HF checkpoint only carries one family
+    (``blocks.{1,2,3}``), so the list-alias keys are resolved from their matched
+    ``block{i}`` counterparts after the conv pass.
+
+    Raises:
+        ValueError: if a remapped conv key is unknown, a shape mismatches, or a
+            target key is left unfilled (so a silent drop is loud).
+    """
+    expected = set(backbone_params)
+    remapped: Dict[str, mx.array] = {}
+
+    for key, value in weights.items():
+        if "num_batches_tracked" in key:
+            continue
+        target = _remap_ecapa_key(key)
+        if target.endswith(".weight") and value.ndim == 3:
+            value = _transpose_conv1d_weight(value)
+        if target not in expected:
+            raise ValueError(f"Remapped key {key!r} -> {target!r} not in backbone")
+        if tuple(value.shape) != tuple(backbone_params[target].shape):
+            raise ValueError(
+                f"Shape mismatch for {target!r}: checkpoint {tuple(value.shape)} "
+                f"vs backbone {tuple(backbone_params[target].shape)}"
+            )
+        remapped[target] = value
+
+    for key, ref in backbone_params.items():
+        if key in remapped:
+            continue
+        if _is_batchnorm_param(key):
+            # BatchNorm is absent from the checkpoint -> identity (a uniform,
+            # cosine-invariant scale): running_mean/bias = 0, running_var/weight = 1.
+            leaf = key.rsplit(".", 1)[-1]
+            remapped[key] = (
+                mx.zeros(ref.shape)
+                if leaf in ("running_mean", "bias")
+                else mx.ones(ref.shape)
+            )
+            continue
+        alias = _blocks_list_alias(key)
+        if alias is not None and alias in remapped:
+            # ``blocks.{i}.X`` list-alias of an already-matched ``block{i+1}.X``.
+            remapped[key] = remapped[alias]
+            continue
+        raise ValueError(f"Unfilled backbone key {key!r}")
+
+    return {
+        k: v.astype(_ecapa_target_dtype(k, weight_dtype)) for k, v in remapped.items()
+    }
+
+
+def _is_batchnorm_param(key: str) -> bool:
+    """True for an ``EcapaTdnnBackbone`` BatchNorm parameter key.
+
+    BatchNorm params live under a ``.norm.`` submodule (``...norm.weight`` etc.) or
+    the top-level ``asp_bn`` module — never under a ``.conv.`` submodule.
+    """
+    parts = key.split(".")
+    if len(parts) < 2:
+        return False
+    parent = parts[-2]
+    return parent == "norm" or parts[0] == "asp_bn"
+
+
+def _blocks_list_alias(key: str) -> str | None:
+    """Map a ``blocks.{i}.X`` list-alias key to its ``block{i+1}.X`` counterpart.
+
+    The shared backbone exposes the SE-Res2Net blocks both as ``block{1,2,3}``
+    attributes and a ``self.blocks`` list (``blocks.{0,1,2}``) over the same
+    objects. Returns ``None`` for non-list keys (incl. the ``blocks.N.`` keys that
+    are part of a ``res2net_block``).
+    """
+    parts = key.split(".")
+    if len(parts) >= 2 and parts[0] == "blocks" and parts[1].isdigit():
+        return f"block{int(parts[1]) + 1}." + ".".join(parts[2:])
+    return None
+
+
+def _ecapa_target_dtype(key: str, weight_dtype: mx.Dtype) -> mx.Dtype:
+    """BatchNorm stats / norms stay fp32; conv weights and biases cast."""
+    if any(sub in key for sub in _ECAPA_FP32_SUBSTRINGS):
+        return mx.float32
+    return weight_dtype
+
+
+def _flat_params(module) -> Dict[str, mx.array]:
+    """Flatten an ``nn.Module`` parameter tree to ``{"a.b.c": array}``."""
+    from mlx.utils import tree_flatten
+
+    return dict(tree_flatten(module.parameters()))
 
 
 def convert_voice_embedder(
-    hf_repo: str = "marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B",
+    hf_repo: str = _ECAPA_VOICE_REPO,
     out_dir: str | Path = "./models/zonos2-voice-embedder-mlx",
     dtype: str = "bfloat16",
 ) -> Path:
-    """Convert the Qwen3-1.7B voice-embedder backbone (HF -> MLX safetensors).
+    """Convert the ECAPA-TDNN voice embedder (HF -> MLX ``EcapaTdnnBackbone``).
 
-    The mlx-audio ``qwen3`` model reuses ``mlx_lm.models.qwen3`` (``Model`` /
-    ``ModelArgs``), so the HF -> MLX conversion is exactly the standard mlx_lm
-    qwen3 path (sanitize = drop tied ``lm_head.weight``). This delegates to
-    ``mlx_lm.convert`` rather than re-implementing the qwen3 sanitize logic.
-
-    NOTE: the voice embedder uses the qwen3 backbone hidden states (2048-D) as a
-    speaker embedding; the embedding-head / mel-frontend wiring is finalized by
-    the coordinator in ``speaker_encoder.py`` (CONTRACT.md §5). This produces the
-    plain MLX-format qwen3 weights that the embedder loads.
+    The HF repo (misleadingly named "Qwen3-Voice-Embedding") ships an
+    ``EcapaTdnnSpeakerEncoder``; this loads its ``model.safetensors``, remaps the
+    Conv1d state-dict onto the shared MLX backbone, writes ``model.safetensors``,
+    and copies the checkpoint ``config.json`` / ``preprocessor_config.json``.
 
     Args:
-        hf_repo: HuggingFace repo id for the voice-embedding Qwen3 backbone.
+        hf_repo: HuggingFace repo id (or a local directory) for the ECAPA encoder.
         out_dir: output directory for the MLX model.
-        dtype: target weight dtype.
+        dtype: target weight dtype (norms/BatchNorm stats are always fp32).
 
     Returns:
         The output directory as a ``Path``.
     """
-    from mlx_lm import convert as mlx_lm_convert
+    if dtype not in _DTYPE_MAP:
+        raise ValueError(
+            f"Unsupported dtype {dtype!r}; choose one of {list(_DTYPE_MAP)}"
+        )
+    weight_dtype = _DTYPE_MAP[dtype]
+
+    from mlx_audio.codec.models.ecapa_tdnn import EcapaTdnnBackbone
+    from mlx_audio.tts.models.zonos2.config import ZONOS2Config
+    from mlx_audio.tts.models.zonos2.speaker_encoder import ecapa_config_from_zonos2
+
+    src_dir = Path(hf_repo)
+    if not src_dir.is_dir():
+        from huggingface_hub import snapshot_download
+
+        src_dir = Path(
+            snapshot_download(
+                hf_repo,
+                allow_patterns=[
+                    "model.safetensors",
+                    "config.json",
+                    "preprocessor_config.json",
+                ],
+            )
+        )
+
+    print(f"Converting ECAPA voice embedder {hf_repo} → {out_dir} (dtype={dtype})…")
+    weights = mx.load(str(src_dir / "model.safetensors"))
+    print(f"  {len(weights)} checkpoint tensors")
+
+    # Build the target backbone (same ECAPA config the embedder uses) to derive
+    # the expected conv + BatchNorm key set; the mel frontend is not needed here.
+    backbone = EcapaTdnnBackbone(ecapa_config_from_zonos2(ZONOS2Config()))
+    backbone_params = _flat_params(backbone)
+
+    remapped = remap_ecapa_state_dict(weights, backbone_params, weight_dtype)
 
     out_dir = Path(out_dir)
-    print(f"Converting voice embedder {hf_repo} → {out_dir} (dtype={dtype})…")
-    mlx_lm_convert(hf_repo, str(out_dir), dtype=dtype)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "model.safetensors"
+    mx.save_safetensors(str(out_path), remapped)
+    size_mb = out_path.stat().st_size / 1e6
+    print(f"  saved {out_path.name} ({size_mb:.0f} MB, {len(remapped)} tensors)")
+
+    for cfg_name in ("config.json", "preprocessor_config.json"):
+        src_cfg = src_dir / cfg_name
+        if src_cfg.exists():
+            (out_dir / cfg_name).write_bytes(src_cfg.read_bytes())
+
     print(f"Done → {out_dir}")
     return out_dir
 

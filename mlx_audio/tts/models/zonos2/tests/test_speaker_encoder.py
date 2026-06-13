@@ -1,9 +1,9 @@
-"""Synthetic shape/wiring tests for the ZONOS2 voice encoder.
+"""Synthetic shape/wiring tests for the ZONOS2 voice (speaker) encoder.
 
 No weights and no GPU: verifies that the log-mel frontend matches the upstream
-frame geometry and that the Qwen3-backbone wrapper threads mel features through
-to a per-frame hidden state of the configured width. Full numerical/CUDA parity
-is the Phase-D coordinator gate.
+frame geometry and that the ECAPA-TDNN backbone wrapper pools the mel features
+into a single utterance-level x-vector ``[B, embed_dim]``. Full numerical parity
+vs the real checkpoint is covered by ``parity_test/zonos2/check_ecapa.py``.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from mlx_audio.tts.models.zonos2.config import ZONOS2Config
 from mlx_audio.tts.models.zonos2.speaker_encoder import (
     Qwen3VoiceEmbedding,
     VoiceMelFrontend,
+    ecapa_config_from_zonos2,
 )
 
 _SAMPLE_RATE = 24_000
@@ -41,17 +42,17 @@ def _sine(num_samples: int, freq_hz: float = 220.0) -> mx.array:
     )
 
 
-def _tiny_config(hidden: int = 32) -> ZONOS2Config:
-    """A small backbone config for fast shape-flow testing."""
+def _tiny_config(embed_dim: int = 2048) -> ZONOS2Config:
+    """A small config for fast shape-flow testing (ECAPA geometry is fixed)."""
     return ZONOS2Config(
         n_layers=2,
-        dim=hidden,
+        dim=32,
         head_dim=8,
         n_heads=4,
         n_kv_heads=2,
-        speaker_embedding_dim=hidden,
+        speaker_embedding_dim=embed_dim,
         max_seqlen=4096,
-        moe_n_experts=1,  # disable MoE; backbone here is plain Qwen3
+        moe_n_experts=1,
     )
 
 
@@ -91,25 +92,37 @@ def test_mel_frontend_rejects_too_short_waveform():
     assert raised
 
 
-def test_voice_embedding_maps_mel_to_hidden_width():
-    hidden = 32
-    config = _tiny_config(hidden=hidden)
+def test_ecapa_config_matches_checkpoint_geometry():
+    """The derived ECAPA config must match the checkpoint's enc_* fields."""
+    cfg = ecapa_config_from_zonos2(_tiny_config(embed_dim=2048))
+    assert cfg.input_size == _N_MELS
+    assert cfg.channels == 512
+    assert cfg.embed_dim == 2048
+    assert cfg.kernel_sizes == [5, 3, 3, 3, 1]
+    assert cfg.dilations == [1, 2, 3, 4, 1]
+    assert cfg.res2net_scale == 8
+    assert cfg.se_channels == 128
+    assert cfg.attention_channels == 128
+    assert cfg.global_context is True
+
+
+def test_voice_embedding_pools_to_embed_dim():
+    embed_dim = 2048
+    config = _tiny_config(embed_dim=embed_dim)
     encoder = Qwen3VoiceEmbedding(config)
 
     wav = _sine(_SAMPLE_RATE)[None, :]  # [1, 24000] already at 24 kHz
     out = encoder(wav, sample_rate=_SAMPLE_RATE)
 
-    frames = _expected_frames(_SAMPLE_RATE)
-    assert out.shape == (1, frames, hidden)
+    # Pooled x-vector: one embedding per clip, NOT a per-frame sequence.
+    assert out.shape == (1, embed_dim)
     assert bool(mx.all(mx.isfinite(out)))
 
 
 def test_voice_embedding_resamples_non_target_rate():
-    hidden = 32
-    encoder = Qwen3VoiceEmbedding(_tiny_config(hidden=hidden))
+    embed_dim = 2048
+    encoder = Qwen3VoiceEmbedding(_tiny_config(embed_dim=embed_dim))
 
-    # Non-integer ratio (44.1 kHz -> 24 kHz) so the frame count is derived from the
-    # actual resampled length, not an integer multiple that can't fail.
     src_sr = 44_100
     n_in = src_sr  # 1 second
     wav = mx.array(
@@ -118,18 +131,28 @@ def test_voice_embedding_resamples_non_target_rate():
     )
     out = encoder(wav, sample_rate=src_sr)
 
+    assert out.shape == (1, embed_dim)
+    assert bool(mx.all(mx.isfinite(out)))
+
+    # The pooled output hides the frame count, so assert the resample stage itself
+    # actually changed the length (44.1 kHz -> 24 kHz) via the prepared waveform.
+    prepared = encoder._prepare_input(wav, src_sr)
     n_resampled = max(1, round(n_in * _SAMPLE_RATE / src_sr))
-    assert out.shape == (1, _expected_frames(n_resampled), hidden)
-    # The resampled length must differ from the source length (resample happened).
+    assert prepared.shape == (1, n_resampled)
     assert n_resampled != n_in
 
 
 def test_voice_embedding_downmixes_stereo():
-    hidden = 32
-    encoder = Qwen3VoiceEmbedding(_tiny_config(hidden=hidden))
+    embed_dim = 2048
+    encoder = Qwen3VoiceEmbedding(_tiny_config(embed_dim=embed_dim))
 
     mono = _sine(_SAMPLE_RATE)
     stereo = mx.stack([mono, mono], axis=0)  # [2, 24000]
     out = encoder(stereo, sample_rate=_SAMPLE_RATE)
 
-    assert out.shape == (1, _expected_frames(_SAMPLE_RATE), hidden)
+    assert out.shape == (1, embed_dim)
+    # Channel-averaging a duplicated stereo clip must equal the mono embedding
+    # (downmix is a mean over channels, NOT a batch of two clips).
+    mono_out = encoder(mono, sample_rate=_SAMPLE_RATE)
+    assert mono_out.shape == (1, embed_dim)
+    assert bool(mx.allclose(out, mono_out, atol=1e-4))
