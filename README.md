@@ -136,6 +136,7 @@ for result in model.generate(
 | **MOSS-TTS** | 8B delay-pattern and 1.7B local-transformer multilingual TTS with voice cloning | 31 languages | [OpenMOSS-Team/MOSS-TTS-v1.5](https://huggingface.co/OpenMOSS-Team/MOSS-TTS-v1.5), [OpenMOSS-Team/MOSS-TTS](https://huggingface.co/OpenMOSS-Team/MOSS-TTS), [OpenMOSS-Team/MOSS-TTS-Local-Transformer](https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Local-Transformer) |
 | **MOSS-TTS-Nano** | Tiny multilingual voice-cloning TTS | 20 languages | [mlx-community/MOSS-TTS-Nano-100M](https://huggingface.co/mlx-community/MOSS-TTS-Nano-100M) |
 | **Higgs Audio v2** | 3B Llama-backed TTS with real-time voice cloning | EN, ZH, KO, DE, ES | [bf16 (upstream)](https://huggingface.co/bosonai/higgs-audio-v2-generation-3B-base), [q8](https://huggingface.co/mlx-community/higgs-audio-v2-3B-mlx-q8), [q6](https://huggingface.co/mlx-community/higgs-audio-v2-3B-mlx-q6) |
+| **ZONOS2** | 8B sparse-MoE autoregressive TTS with voice cloning and quality conditioning | EN, ZH, JA, KO, RU, + more | [Zyphra/ZONOS2](https://huggingface.co/Zyphra/ZONOS2) · [README](mlx_audio/tts/models/zonos2/README.md) |
 
 ### Speech-to-Text (STT)
 
